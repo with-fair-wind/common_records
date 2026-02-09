@@ -1,0 +1,561 @@
+### 通用文件/目录复制脚本
+### 功能：支持单个或多个复制任务，支持多目标，带详细日志和进度显示
+$ErrorActionPreference = 'Stop'
+
+function Copy-FilesWithProgress {
+    <#
+    .SYNOPSIS
+        带进度显示的文件/目录复制函数
+    
+    .PARAMETER SourceDir
+        源目录路径
+    
+    .PARAMETER DestDirs
+        目标目录路径数组（支持多个目标）
+    
+    .PARAMETER Mode
+        复制模式：
+        - 'Files': 复制指定的文件列表
+        - 'Mirror': 镜像同步整个目录（会删除目标目录中多余的文件）
+        - 'Sync': 同步整个目录（不删除目标目录中的额外文件）
+    
+    .PARAMETER Files
+        要复制的文件列表（仅在 Mode = 'Files' 时有效）
+        支持文件名、相对路径、子目录
+    
+    .PARAMETER Title
+        任务标题
+    
+    .PARAMETER Enabled
+        是否启用该任务
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourceDir,
+        
+        [Parameter(Mandatory)]
+        [string[]]$DestDirs,
+        
+        [ValidateSet('Files', 'Mirror', 'Sync')]
+        [string]$Mode = 'Sync',
+        
+        [string[]]$Files = @(),
+        
+        [string]$Title = '复制任务',
+        
+        [bool]$Enabled = $true
+    )
+    
+    if (-not $Enabled) {
+        Write-Host ("# 跳过任务: {0} (已禁用)" -f $Title) -ForegroundColor DarkYellow
+        return [PSCustomObject]@{
+            Title        = $Title
+            Success      = 0
+            Errors       = 0
+            Skipped      = $true
+            CopiedSizeMB = 0
+        }
+    }
+    
+    Write-Host ""
+    Write-Host ("# {0}" -f $Title) -ForegroundColor Cyan
+    Write-Host ("=" * 80) -ForegroundColor DarkGray
+    Write-Host "源目录:   " -ForegroundColor Yellow -NoNewline
+    Write-Host $SourceDir -ForegroundColor White
+    Write-Host "目标目录列表:" -ForegroundColor Yellow
+    foreach ($dest in $DestDirs) {
+        Write-Host "  - $dest" -ForegroundColor White
+    }
+    Write-Host "复制模式: " -ForegroundColor Yellow -NoNewline
+    
+    switch ($Mode) {
+        'Files' { Write-Host "指定文件列表" -ForegroundColor Green }
+        'Mirror' { Write-Host "镜像同步 (删除多余文件)" -ForegroundColor Magenta }
+        'Sync' { Write-Host "完整同步 (保留额外文件)" -ForegroundColor Cyan }
+    }
+    
+    Write-Host ("=" * 80) -ForegroundColor DarkGray
+    
+    # 检查源目录
+    if (-not (Test-Path -LiteralPath $SourceDir)) {
+        throw "源目录不存在: $SourceDir"
+    }
+    
+    # 创建所有目标目录
+    foreach ($destDir in $DestDirs) {
+        if (-not (Test-Path -LiteralPath $destDir)) {
+            Write-Host "正在创建目标目录: $destDir" -ForegroundColor DarkYellow
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            Write-Host "✓ 目标目录创建成功" -ForegroundColor Green
+        }
+    }
+    
+    Write-Host ""
+    
+    $startTime = Get-Date
+    $copiedCount = 0
+    $skippedCount = 0
+    $errorCount = 0
+    $copiedSize = 0
+    
+    # 根据模式确定要复制的文件
+    if ($Mode -eq 'Files') {
+        # ========== 指定文件模式 ==========
+        if ($Files.Count -eq 0) {
+            throw "Mode='Files' 时必须指定 Files 参数"
+        }
+        
+        $totalTasks = $Files.Count * $DestDirs.Count
+        Write-Host "要复制的文件/目录: $($Files.Count) 个" -ForegroundColor Gray
+        Write-Host "目标数量: $($DestDirs.Count) 个" -ForegroundColor Gray
+        Write-Host "总任务数: $totalTasks 次复制" -ForegroundColor Gray
+        Write-Host ""
+        
+        foreach ($file in $Files) {
+            Write-Host ""
+            Write-Host "正在复制: $file" -ForegroundColor White
+            
+            $relativePath = $file.Trim().TrimEnd('\', '/')
+            $sourcePath = Join-Path -Path $SourceDir -ChildPath $relativePath
+            
+            if (-not (Test-Path -LiteralPath $sourcePath)) {
+                Write-Host "  (T_T) 未找到文件: $sourcePath" -ForegroundColor Red
+                $errorCount += $DestDirs.Count
+                continue
+            }
+            
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force
+            $isDirectory = $sourceItem.PSIsContainer
+            
+            if ($isDirectory) {
+                # 复制目录到所有目标
+                $dirFiles = Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force
+                
+                foreach ($destDir in $DestDirs) {
+                    Write-Host "  -> $destDir " -ForegroundColor Gray -NoNewline
+                    
+                    $destPath = Join-Path -Path $destDir -ChildPath $relativePath
+                    $filesCopied = 0
+                    $dirErrors = 0
+                    
+                    foreach ($dirFile in $dirFiles) {
+                        $fileRelativePath = $dirFile.FullName.Substring($sourcePath.Length).TrimStart('\', '/')
+                        $destFilePath = Join-Path -Path $destPath -ChildPath $fileRelativePath
+                        $destFileParent = Split-Path -Path $destFilePath -Parent
+                        
+                        if (-not (Test-Path -LiteralPath $destFileParent)) {
+                            New-Item -ItemType Directory -Path $destFileParent -Force | Out-Null
+                        }
+                        
+                        try {
+                            Copy-Item -LiteralPath $dirFile.FullName -Destination $destFilePath -Force -ErrorAction Stop
+                            $copiedSize += $dirFile.Length
+                            $filesCopied++
+                        }
+                        catch {
+                            $dirErrors++
+                        }
+                    }
+                    
+                    if ($dirErrors -eq 0) {
+                        $copiedCount++
+                        Write-Host "✓ ($filesCopied 个文件) (^_^)" -ForegroundColor Green
+                    }
+                    else {
+                        $errorCount++
+                        Write-Host "✗ (成功 $filesCopied, 失败 $dirErrors) (╥﹏╥)" -ForegroundColor Red
+                    }
+                }
+            }
+            else {
+                # 复制单个文件到所有目标
+                $fileSizeKB = [math]::Round($sourceItem.Length / 1KB, 2)
+                
+                foreach ($destDir in $DestDirs) {
+                    $destPath = Join-Path -Path $destDir -ChildPath $relativePath
+                    $destParent = Split-Path -Path $destPath -Parent
+                    
+                    if (-not [string]::IsNullOrWhiteSpace($destParent) -and -not (Test-Path -LiteralPath $destParent)) {
+                        New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+                    }
+                    
+                    Write-Host "  -> $destDir " -ForegroundColor Gray -NoNewline
+                    
+                    try {
+                        Copy-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
+                        $copiedCount++
+                        $copiedSize += $sourceItem.Length
+                        Write-Host "✓ ($fileSizeKB KB) (^_^)" -ForegroundColor Green
+                    }
+                    catch {
+                        $errorCount++
+                        Write-Host "✗ [错误: $($_.Exception.Message)] (╥﹏╥)" -ForegroundColor Red
+                    }
+                }
+            }
+        }
+    }
+    else {
+        # ========== 同步/镜像模式 ==========
+        Write-Host "正在扫描源目录..." -ForegroundColor Cyan
+        
+        $allFiles = Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force
+        $totalFiles = $allFiles.Count
+        $totalSize = ($allFiles | Measure-Object -Property Length -Sum).Sum
+        $totalSizeMB = [math]::Round($totalSize / 1MB, 2)
+        $totalTasks = $totalFiles * $DestDirs.Count
+        
+        Write-Host "✓ 扫描完成: $totalFiles 个文件, $totalSizeMB MB" -ForegroundColor Green
+        Write-Host "目标数量: $($DestDirs.Count) 个" -ForegroundColor Gray
+        Write-Host "总任务数: $totalTasks 次复制" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "开始复制..." -ForegroundColor Cyan
+        
+        $processedCount = 0
+        foreach ($file in $allFiles) {
+            $processedCount++
+            $relativePath = $file.FullName.Substring($SourceDir.Length).TrimStart('\', '/')
+            $fileSizeKB = [math]::Round($file.Length / 1KB, 2)
+            
+            foreach ($destDir in $DestDirs) {
+                $destPath = Join-Path -Path $destDir -ChildPath $relativePath
+                $destParent = Split-Path -Path $destPath -Parent
+                
+                if (-not (Test-Path -LiteralPath $destParent)) {
+                    New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+                }
+                
+                # 检查是否需要复制
+                $needCopy = $true
+                if (Test-Path -LiteralPath $destPath) {
+                    $destFile = Get-Item -LiteralPath $destPath
+                    if ($file.Length -eq $destFile.Length -and 
+                        $file.LastWriteTime -eq $destFile.LastWriteTime) {
+                        $needCopy = $false
+                    }
+                }
+                
+                if ($needCopy) {
+                    try {
+                        Copy-Item -LiteralPath $file.FullName -Destination $destPath -Force -ErrorAction Stop
+                        $copiedCount++
+                        
+                        # 只对第一个目标计入复制大小（避免重复计算）
+                        if ($destDir -eq $DestDirs[0]) {
+                            $copiedSize += $file.Length
+                        }
+                        
+                        $progress = [math]::Round($processedCount / $totalFiles * 100, 1)
+                        
+                        # 精简输出：只显示第一个目标，其他目标用简写
+                        if ($DestDirs.Count -gt 1 -and $destDir -ne $DestDirs[0]) {
+                            # 不输出，在最后一个目标时统一输出
+                            if ($destDir -eq $DestDirs[-1]) {
+                                Write-Host "[$progress%] ✓ " -ForegroundColor Green -NoNewline
+                                Write-Host "$relativePath " -ForegroundColor Gray -NoNewline
+                                Write-Host "-> $($DestDirs.Count) 个目标 " -ForegroundColor DarkCyan -NoNewline
+                                Write-Host "($fileSizeKB KB)" -ForegroundColor DarkGray
+                            }
+                        }
+                        else {
+                            Write-Host "[$progress%] ✓ " -ForegroundColor Green -NoNewline
+                            Write-Host "$relativePath " -ForegroundColor Gray -NoNewline
+                            if ($DestDirs.Count -eq 1) {
+                                Write-Host "($fileSizeKB KB)" -ForegroundColor DarkGray
+                            }
+                            else {
+                                Write-Host "-> $($DestDirs.Count) 个目标 " -ForegroundColor DarkCyan -NoNewline
+                                Write-Host "($fileSizeKB KB)" -ForegroundColor DarkGray
+                            }
+                        }
+                    }
+                    catch {
+                        $errorCount++
+                        $progress = [math]::Round($processedCount / $totalFiles * 100, 1)
+                        Write-Host "[$progress%] ✗ " -ForegroundColor Red -NoNewline
+                        Write-Host "$relativePath -> $destDir " -ForegroundColor Gray -NoNewline
+                        Write-Host "[错误: $($_.Exception.Message)]" -ForegroundColor Red
+                    }
+                }
+                else {
+                    $skippedCount++
+                }
+            }
+            
+            # 每50个文件显示一次跳过进度
+            if ($skippedCount % (50 * $DestDirs.Count) -eq 0 -and $skippedCount -gt 0) {
+                $progress = [math]::Round($processedCount / $totalFiles * 100, 1)
+                Write-Host "[$progress%] 已跳过 $skippedCount 个相同文件..." -ForegroundColor DarkGray
+            }
+        }
+        
+        # 镜像模式：删除多余文件
+        if ($Mode -eq 'Mirror') {
+            Write-Host ""
+            Write-Host "检查目标目录中的多余文件..." -ForegroundColor Cyan
+            
+            $deletedCount = 0
+            foreach ($destDir in $DestDirs) {
+                Write-Host "正在检查: $destDir" -ForegroundColor Gray
+                
+                if (-not (Test-Path -LiteralPath $destDir)) {
+                    continue
+                }
+                
+                $destFiles = Get-ChildItem -LiteralPath $destDir -Recurse -File -Force
+                
+                foreach ($destFile in $destFiles) {
+                    $relativePath = $destFile.FullName.Substring($destDir.Length).TrimStart('\', '/')
+                    $sourcePath = Join-Path -Path $SourceDir -ChildPath $relativePath
+                    
+                    if (-not (Test-Path -LiteralPath $sourcePath)) {
+                        try {
+                            Remove-Item -LiteralPath $destFile.FullName -Force -ErrorAction Stop
+                            $deletedCount++
+                            Write-Host "  ✗ 已删除多余文件: " -ForegroundColor Red -NoNewline
+                            Write-Host $relativePath -ForegroundColor Gray
+                        }
+                        catch {
+                            Write-Host "  ✗ 删除失败: " -ForegroundColor Red -NoNewline
+                            Write-Host "$relativePath [错误: $($_.Exception.Message)]" -ForegroundColor Red
+                        }
+                    }
+                }
+                
+                # 清理空目录
+                $emptyDirs = Get-ChildItem -LiteralPath $destDir -Recurse -Directory -Force | Sort-Object -Property FullName -Descending
+                foreach ($dir in $emptyDirs) {
+                    if ((Get-ChildItem -LiteralPath $dir.FullName -Force).Count -eq 0) {
+                        try {
+                            Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
+                        }
+                        catch {
+                            # 忽略删除目录的错误
+                        }
+                    }
+                }
+            }
+            
+            if ($deletedCount -gt 0) {
+                Write-Host "✓ 已删除 $deletedCount 个多余文件" -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "✓ 未发现多余文件" -ForegroundColor Green
+            }
+        }
+    }
+    
+    $endTime = Get-Date
+    $duration = $endTime - $startTime
+    $copiedSizeMB = [math]::Round($copiedSize / 1MB, 2)
+    
+    Write-Host ""
+    Write-Host ("=" * 80) -ForegroundColor DarkGray
+    Write-Host "任务完成！" -ForegroundColor Cyan
+    Write-Host "  已复制: " -ForegroundColor Green -NoNewline
+    Write-Host "$copiedCount 个文件 ($copiedSizeMB MB)" -ForegroundColor White
+    
+    if ($skippedCount -gt 0) {
+        Write-Host "  已跳过: " -ForegroundColor Yellow -NoNewline
+        Write-Host "$skippedCount 个文件 (文件相同)" -ForegroundColor White
+    }
+    
+    if ($errorCount -gt 0) {
+        Write-Host "  失败: " -ForegroundColor Red -NoNewline
+        Write-Host "$errorCount 个文件" -ForegroundColor White
+    }
+    
+    Write-Host "  耗时: " -ForegroundColor Gray -NoNewline
+    Write-Host ("{0:mm}分{0:ss}秒" -f $duration) -ForegroundColor White
+    Write-Host ("=" * 80) -ForegroundColor DarkGray
+    
+    if ($errorCount -eq 0) {
+        Write-Host "✓ 所有操作成功完成！(^_^)" -ForegroundColor Green
+    }
+    else {
+        Write-Host "⚠ 部分文件处理失败，请检查错误信息 (╥﹏╥)" -ForegroundColor Yellow
+    }
+    
+    return [PSCustomObject]@{
+        Title        = $Title
+        Success      = $copiedCount
+        Skipped      = $skippedCount
+        Errors       = $errorCount
+        CopiedSizeMB = $copiedSizeMB
+        Duration     = $duration
+    }
+}
+
+# ==================== 任务配置 ====================
+# 在这里配置你的复制任务
+
+$tasks = @(
+    # 示例1：复制整个目录到单个目标（镜像模式）
+    @{
+        Title     = 'VS2026离线安装包同步'
+        Enabled   = $false  # 设为 $true 启用该任务
+        SourceDir = 'E:\code\pwsh\VS2026Offline'
+        DestDirs  = @(
+            'D:\install\VS2026Offline'
+        )
+        Mode      = 'Mirror'  # 镜像模式，会删除目标目录中多余的文件
+    }
+    
+    # 示例2：复制整个目录到多个目标（同步模式）
+    @{
+        Title     = '文档多处备份'
+        Enabled   = $false
+        SourceDir = 'D:\Documents'
+        DestDirs  = @(
+            'E:\Backup\Documents',
+            'F:\Archive\Documents',
+            '\\NAS\Backup\Documents'
+        )
+        Mode      = 'Sync'  # 同步模式，不删除目标目录中的额外文件
+    }
+    
+    # 示例3：复制指定文件列表到单个目标
+    @{
+        Title     = '编译输出文件复制'
+        Enabled   = $false
+        SourceDir = 'D:\project\bin\Release'
+        DestDirs  = @(
+            'D:\deploy\app'
+        )
+        Mode      = 'Files'
+        Files     = @(
+            'app.exe',
+            'config.json',
+            'lib\module1.dll',
+            'lib\module2.dll',
+            'data\'  # 复制整个 data 子目录
+        )
+    }
+    
+    # 示例4：复制指定文件列表到多个目标（最常用场景）
+    @{
+        Title     = 'ZRX文件多环境部署'
+        Enabled   = $false
+        SourceDir = 'D:\work\code\output\Debug_Zrx2026_x64\arx'
+        DestDirs  = @(
+            'D:\work\env\SketchDesign\trunk\package\64位环境\ZW2026-OEM\arx',
+            'D:\work\code\电缆设计-配电设计\arx',
+            'D:\Program Files\EAP2026\arx'
+        )
+        Mode      = 'Files'
+        Files     = @(
+            'GZPDM.zrx',
+            'BcBPDS.zrx',
+            'byqpmsj.zrx',
+            'BPDS_DrawWire.zrx'
+        )
+    }
+
+    @{
+        Title     = '测试'
+        Enabled   = $true  # 设为 $true 启用该任务
+        SourceDir = 'E:\code\C++_Project\C++11'
+        DestDirs  = @(
+            'D:\code\cpp\C++11'
+        )
+        Mode      = 'Sync'  # 镜像模式，会删除目标目录中多余的文件
+    }
+)
+
+# ==================== 执行任务 ====================
+
+try {
+    Write-Host ""
+    Write-Host "╔═══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║              通用文件复制脚本 v2.0                           ║" -ForegroundColor Cyan
+    Write-Host "║              支持多目标复制                                  ║" -ForegroundColor Cyan
+    Write-Host "╚═══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    
+    if ($tasks.Count -eq 0) {
+        Write-Host "⚠ 没有配置任何任务！" -ForegroundColor Yellow
+        Write-Host "请编辑脚本中的 `$tasks 数组，添加你的复制任务。" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "按任意键退出..." -ForegroundColor DarkGray
+        Read-Host | Out-Null
+        exit 0
+    }
+    
+    $enabledTasks = $tasks | Where-Object { $_.Enabled -eq $true }
+    
+    if ($enabledTasks.Count -eq 0) {
+        Write-Host "⚠ 所有任务都已禁用！" -ForegroundColor Yellow
+        Write-Host "请将需要执行的任务的 Enabled 设为 `$true" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "按任意键退出..." -ForegroundColor DarkGray
+        Read-Host | Out-Null
+        exit 0
+    }
+    
+    Write-Host "共有 $($tasks.Count) 个任务，其中 $($enabledTasks.Count) 个已启用" -ForegroundColor Gray
+    Write-Host ""
+    
+    $results = @()
+    foreach ($task in $tasks) {
+        $results += Copy-FilesWithProgress @task
+    }
+    
+    # 输出汇总
+    if ($results.Count -gt 1) {
+        $enabledResults = $results | Where-Object { -not $_.Skipped }
+        if ($enabledResults.Count -gt 0) {
+            Write-Host ""
+            Write-Host ("═" * 80) -ForegroundColor Cyan
+            Write-Host "所有任务汇总统计" -ForegroundColor Cyan
+            Write-Host ("═" * 80) -ForegroundColor Cyan
+            
+            $totalSuccess = ($enabledResults | Measure-Object -Property Success -Sum).Sum
+            $totalSkipped = ($enabledResults | Measure-Object -Property Skipped -Sum).Sum
+            $totalErrors = ($enabledResults | Measure-Object -Property Errors -Sum).Sum
+            $totalSizeMB = ($enabledResults | Measure-Object -Property CopiedSizeMB -Sum).Sum
+            $totalSizeMB = [math]::Round($totalSizeMB, 2)
+            
+            Write-Host "  已复制: " -ForegroundColor Green -NoNewline
+            Write-Host "$totalSuccess 个文件 ($totalSizeMB MB)" -ForegroundColor White
+            
+            if ($totalSkipped -gt 0) {
+                Write-Host "  已跳过: " -ForegroundColor Yellow -NoNewline
+                Write-Host "$totalSkipped 个文件" -ForegroundColor White
+            }
+            
+            if ($totalErrors -gt 0) {
+                Write-Host "  失败: " -ForegroundColor Red -NoNewline
+                Write-Host "$totalErrors 个文件" -ForegroundColor White
+            }
+            
+            Write-Host ("═" * 80) -ForegroundColor Cyan
+            
+            if ($totalErrors -eq 0) {
+                Write-Host "✓ 所有任务成功完成！\\(^o^)/" -ForegroundColor Green
+            }
+            else {
+                Write-Host "⚠ 部分任务存在错误，请查看详细日志" -ForegroundColor Yellow
+            }
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "全部任务处理完成，按任意键退出..." -ForegroundColor DarkGray
+    Read-Host | Out-Null
+    
+    exit 0
+}
+catch {
+    Write-Host ""
+    Write-Host ("═" * 80) -ForegroundColor Red
+    Write-Host "发生严重错误！" -ForegroundColor Red
+    Write-Host ("═" * 80) -ForegroundColor Red
+    Write-Host "错误信息: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "错误位置: 第 $($_.InvocationInfo.ScriptLineNumber) 行" -ForegroundColor Red
+    Write-Host ("═" * 80) -ForegroundColor Red
+    Write-Host ""
+    Write-Host "按任意键退出..." -ForegroundColor DarkGray
+    Read-Host | Out-Null
+    
+    exit 1
+}
