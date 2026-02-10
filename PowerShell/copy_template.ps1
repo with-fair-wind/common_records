@@ -1,9 +1,11 @@
-### 通用文件/目录复制脚本 v2.1
-### 功能：支持单个或多个复制任务，支持多目标，智能跳过相同文件
+### 通用文件/目录复制脚本 v2.2
+### 功能：支持单个或多个复制任务，支持多目标，智能跳过相同文件，支持白名单和黑名单
 ### 特性：
-###   - Files 参数：可选，指定要复制的文件/目录列表（不指定则复制整个目录）
+###   - Files 参数（白名单）：可选，指定要复制的文件/目录列表
+###   - Exclude 参数（黑名单）：可选，指定要排除的文件/目录列表
 ###   - Mode 参数：Sync（保留额外文件）或 Mirror（删除多余文件）
 ###   - 智能跳过：自动对比文件大小和修改时间，跳过相同文件
+###   - 三种模式：完整目录 / 白名单（只复制指定） / 黑名单（排除指定）
 $ErrorActionPreference = 'Stop'
 
 function Copy-FilesWithProgress {
@@ -23,15 +25,22 @@ function Copy-FilesWithProgress {
         - 'Mirror': 镜像模式（删除目标目录中多余的文件）
         
         说明：
-        - 如果提供 Files 参数：只复制指定的文件/目录
-        - 如果不提供 Files 参数：复制整个源目录
+        - Files 参数（白名单）：只复制指定的文件/目录
+        - Exclude 参数（黑名单）：复制整个目录，但排除指定的文件/目录
+        - 无参数：复制整个源目录
         - Mode 控制是否删除多余文件（Sync=保留，Mirror=删除）
     
     .PARAMETER Files
-        要复制的文件列表（可选）
+        要复制的文件列表（可选，白名单模式）
         - 如果指定：只复制列表中的文件/目录
-        - 如果不指定：复制整个源目录
         - 支持文件名、相对路径、子目录
+        - 不能与 Exclude 同时使用
+    
+    .PARAMETER Exclude
+        要排除的文件列表（可选，黑名单模式）
+        - 如果指定：复制整个目录，但排除列表中的文件/目录
+        - 支持文件名、相对路径、子目录
+        - 不能与 Files 同时使用
     
     .PARAMETER Title
         任务标题
@@ -51,10 +60,17 @@ function Copy-FilesWithProgress {
         
         [string[]]$Files = @(),
         
+        [string[]]$Exclude = @(),
+        
         [string]$Title = '复制任务',
         
         [bool]$Enabled = $true
     )
+    
+    # 参数验证
+    if ($Files.Count -gt 0 -and $Exclude.Count -gt 0) {
+        throw "Files 和 Exclude 参数不能同时使用！请选择白名单模式（Files）或黑名单模式（Exclude）"
+    }
     
     if (-not $Enabled) {
         Write-Host ("# 跳过任务: {0} (已禁用)" -f $Title) -ForegroundColor DarkYellow
@@ -78,11 +94,34 @@ function Copy-FilesWithProgress {
     }
     Write-Host "复制模式: " -ForegroundColor Yellow -NoNewline
     
-    $scopeText = if ($Files.Count -gt 0) { "指定文件" } else { "完整目录" }
+    if ($Files.Count -gt 0) {
+        $scopeText = "指定文件 (白名单: $($Files.Count) 项)"
+    }
+    elseif ($Exclude.Count -gt 0) {
+        $scopeText = "完整目录排除 (黑名单: $($Exclude.Count) 项)"
+    }
+    else {
+        $scopeText = "完整目录"
+    }
+    
     $deleteText = if ($Mode -eq 'Mirror') { "删除多余文件" } else { "保留额外文件" }
     $color = if ($Mode -eq 'Mirror') { "Magenta" } else { "Cyan" }
     
     Write-Host "$scopeText + $Mode ($deleteText)" -ForegroundColor $color
+    
+    # 显示详细的包含/排除列表
+    if ($Files.Count -gt 0) {
+        Write-Host "包含列表:" -ForegroundColor Yellow
+        foreach ($file in $Files) {
+            Write-Host "  + $file" -ForegroundColor Green
+        }
+    }
+    elseif ($Exclude.Count -gt 0) {
+        Write-Host "排除列表:" -ForegroundColor Yellow
+        foreach ($file in $Exclude) {
+            Write-Host "  - $file" -ForegroundColor Red
+        }
+    }
     
     Write-Host ("=" * 80) -ForegroundColor DarkGray
     
@@ -110,9 +149,9 @@ function Copy-FilesWithProgress {
     
     # 根据模式确定要复制的文件
     if ($Files.Count -gt 0) {
-        # ========== 指定文件模式 ==========
+        # ========== 白名单模式：只复制指定文件 ==========
         
-        Write-Host "正在扫描源文件..." -ForegroundColor Cyan
+        Write-Host "正在扫描源文件（白名单模式）..." -ForegroundColor Cyan
         
         # 预先收集所有文件信息，用于计算总数和进度
         $allFileItems = @()
@@ -290,10 +329,53 @@ function Copy-FilesWithProgress {
         }
     }
     else {
-        # ========== 同步/镜像模式 ==========
-        Write-Host "正在扫描源目录..." -ForegroundColor Cyan
+        # ========== 完整目录模式（可能带黑名单） ==========
+        if ($Exclude.Count -gt 0) {
+            Write-Host "正在扫描源目录（黑名单模式）..." -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "正在扫描源目录..." -ForegroundColor Cyan
+        }
         
         $allFiles = Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force
+        
+        # 如果是黑名单模式，需要构建排除集合
+        $excludeSet = $null
+        if ($Exclude.Count -gt 0) {
+            $excludeSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            
+            # 展开排除列表（支持目录和文件）
+            foreach ($excludeItem in $Exclude) {
+                $excludePath = $excludeItem.Trim().TrimEnd('\', '/')
+                $excludeFullPath = Join-Path -Path $SourceDir -ChildPath $excludePath
+                
+                if (Test-Path -LiteralPath $excludeFullPath) {
+                    $item = Get-Item -LiteralPath $excludeFullPath -Force
+                    
+                    if ($item.PSIsContainer) {
+                        # 目录：排除该目录下的所有文件
+                        $excludeDirFiles = Get-ChildItem -LiteralPath $excludeFullPath -Recurse -File -Force
+                        foreach ($file in $excludeDirFiles) {
+                            $relPath = $file.FullName.Substring($SourceDir.Length).TrimStart('\', '/')
+                            [void]$excludeSet.Add($relPath)
+                        }
+                    }
+                    else {
+                        # 文件：直接排除
+                        [void]$excludeSet.Add($excludePath)
+                    }
+                }
+            }
+            
+            # 过滤掉被排除的文件
+            $allFiles = $allFiles | Where-Object {
+                $relativePath = $_.FullName.Substring($SourceDir.Length).TrimStart('\', '/')
+                -not $excludeSet.Contains($relativePath)
+            }
+            
+            Write-Host "✓ 已排除 $($excludeSet.Count) 个文件" -ForegroundColor Yellow
+        }
+        
         $totalFiles = $allFiles.Count
         $totalSize = ($allFiles | Measure-Object -Property Length -Sum).Sum
         $totalSizeMB = [math]::Round($totalSize / 1MB, 2)
@@ -402,11 +484,25 @@ function Copy-FilesWithProgress {
                     $relativePath = $destFile.FullName.Substring($destDir.Length).TrimStart('\', '/')
                     $sourcePath = Join-Path -Path $SourceDir -ChildPath $relativePath
                     
+                    $shouldDelete = $false
+                    $deleteReason = ""
+                    
+                    # 检查1：源目录中不存在
                     if (-not (Test-Path -LiteralPath $sourcePath)) {
+                        $shouldDelete = $true
+                        $deleteReason = "源不存在"
+                    }
+                    # 检查2：在排除列表中（黑名单模式）
+                    elseif ($excludeSet -and $excludeSet.Contains($relativePath)) {
+                        $shouldDelete = $true
+                        $deleteReason = "在排除列表"
+                    }
+                    
+                    if ($shouldDelete) {
                         try {
                             Remove-Item -LiteralPath $destFile.FullName -Force -ErrorAction Stop
                             $deletedCount++
-                            Write-Host "  ✗ 已删除多余文件: " -ForegroundColor Red -NoNewline
+                            Write-Host "  ✗ 已删除多余文件 ($deleteReason): " -ForegroundColor Red -NoNewline
                             Write-Host $relativePath -ForegroundColor Gray
                         }
                         catch {
@@ -545,9 +641,9 @@ $tasks = @(
         )
     }
     
-    # 示例5：指定文件列表 + 镜像模式（删除目标中不在列表的文件）
+    # 示例5：指定文件列表 + 镜像模式（白名单：只保留指定的文件）
     @{
-        Title     = 'Scoop 应用精简镜像'
+        Title     = 'Scoop 应用精简镜像（白名单）'
         Enabled   = $false
         SourceDir = 'D:\scoop\apps'
         DestDirs  = @(
@@ -562,6 +658,41 @@ $tasks = @(
             'msys2',
             'vscode',
             'cursor'
+        )
+    }
+    
+    # 示例6：排除列表 + 同步模式（黑名单：复制整个目录，排除指定的文件）
+    @{
+        Title     = 'Scoop 备份（排除大型应用）'
+        Enabled   = $false
+        SourceDir = 'D:\scoop\apps'
+        DestDirs  = @(
+            'X:\scoop\apps'
+        )
+        Mode      = 'Sync'  # 同步模式：保留额外文件
+        Exclude   = @(
+            'llvm',         # 排除 LLVM（体积大）
+            'nodejs',       # 排除 Node.js
+            'python',       # 排除 Python
+            'visualstudio'  # 排除 Visual Studio
+        )
+    }
+    
+    # 示例7：排除列表 + 镜像模式（黑名单 + 删除排除的文件）
+    @{
+        Title     = '项目代码同步（排除编译产物和缓存）'
+        Enabled   = $false
+        SourceDir = 'D:\project\myapp'
+        DestDirs  = @(
+            'E:\backup\myapp'
+        )
+        Mode      = 'Mirror'  # 镜像模式：删除排除的文件和多余文件
+        Exclude   = @(
+            'bin\',         # 排除编译输出目录
+            'obj\',         # 排除中间文件目录
+            'node_modules\',# 排除 npm 依赖
+            '.vs\',         # 排除 Visual Studio 缓存
+            '.git\'         # 排除 Git 仓库
         )
     }
 
@@ -581,8 +712,8 @@ $tasks = @(
 try {
     Write-Host ""
     Write-Host "╔═══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║              通用文件复制脚本 v2.1                           ║" -ForegroundColor Cyan
-    Write-Host "║       多目标 | 智能跳过 | 指定文件 | Mirror/Sync 模式       ║" -ForegroundColor Cyan
+    Write-Host "║              通用文件复制脚本 v2.2                           ║" -ForegroundColor Cyan
+    Write-Host "║   多目标 | 智能跳过 | 白名单/黑名单 | Mirror/Sync 模式     ║" -ForegroundColor Cyan
     Write-Host "╚═══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
     
