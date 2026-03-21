@@ -697,13 +697,13 @@ $tasks = @(
     }
 
     @{
-        Title     = '测试'
+        Title     = '拷贝VS2022离线安装包'
         Enabled   = $true  # 设为 $true 启用该任务
-        SourceDir = 'E:\code\C++_Project\C++11'
+        SourceDir = 'F:\VS2022Offline'
         DestDirs  = @(
-            'D:\code\cpp\C++11'
+            'D:\install\VS2022Offline'
         )
-        Mode      = 'Sync'  # 同步模式，保留额外文件
+        Mode      = 'Mirror'  # 同步模式，保留额外文件
     }
 )
 
