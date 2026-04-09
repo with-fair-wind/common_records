@@ -1,23 +1,46 @@
 # =========================================================
 # Generate-CursorExtensions.ps1
-# 自动从 %USERPROFILE%\.vscode\extensions\extensions.json
+# 自动定位 extensions.json（支持 -JsonPath 指定）
 # 生成 Cursor / VS Code 扩展清单
 # =========================================================
 
+[CmdletBinding()]
+param (
+    [string]$JsonPath
+)
+
 $ErrorActionPreference = "Stop"
 
-# 自动定位用户目录下的 extensions.json
-$UserProfile = $env:USERPROFILE
-$Input = Join-Path $UserProfile ".vscode\extensions\extensions.json"
+function Resolve-ExtensionsJsonPath {
+    param (
+        [string]$OverridePath
+    )
+
+    if ($OverridePath) {
+        if (Test-Path $OverridePath) {
+            return $OverridePath
+        }
+        throw "找不到 extensions.json（-JsonPath）：$OverridePath"
+    }
+
+    $candidates = @(
+        "D:\scoop\apps\vscode\current\data\extensions\extensions.json",
+        (Join-Path $env:USERPROFILE ".vscode\extensions\extensions.json")
+    )
+
+    foreach ($path in $candidates) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+
+    throw "找不到 extensions.json。已尝试路径：`n - $($candidates -join "`n - ")"
+}
+
+$Input = Resolve-ExtensionsJsonPath -OverridePath $JsonPath
 
 $OutCursor = "extensions-cursor.txt"
 $OutVSCode = "extensions-vscode.txt"
-
-if (!(Test-Path $Input)) {
-    Write-Error "找不到 extensions.json：$Input"
-    Write-Error "请确认文件存在于 .vscode\extensions 目录下"
-    exit 1
-}
 
 # Cursor 明确不支持 / 无意义的扩展前缀
 $ExcludePatterns = @(

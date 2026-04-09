@@ -8,7 +8,9 @@
 [CmdletBinding()]
 param (
     [ValidateSet("cursor", "vscode", "json")]
-    [string]$Mode = "cursor"
+    [string]$Mode = "cursor",
+    [string]$JsonPath,
+    [switch]$PruneOldVersions
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +26,6 @@ $OutDir    = Join-Path $VsixRoot $Mode   # ⭐ 关键：按模式分目录
 
 $CursorList = Join-Path $ScriptDir "extensions-cursor.txt"
 $VSCodeList = Join-Path $ScriptDir "extensions-vscode.txt"
-$JsonPath   = Join-Path $env:USERPROFILE ".vscode\extensions\extensions.json"
 
 $ApiUrl = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.1-preview.1"
 $SleepSeconds = 2
@@ -54,11 +55,33 @@ $ExcludePatterns = @(
 # 扩展来源
 # ------------------------------------------------------------
 
-function Get-ExtensionsFromJson {
-    if (!(Test-Path $JsonPath)) {
-        throw "找不到 extensions.json：$JsonPath"
+$DefaultJsonCandidates = @(
+    "D:\scoop\apps\vscode\current\data\extensions\extensions.json",
+    (Join-Path $env:USERPROFILE ".vscode\extensions\extensions.json")
+)
+
+function Resolve-ExtensionsJsonPath {
+    if ($JsonPath) {
+        if (Test-Path $JsonPath) {
+            return $JsonPath
+        }
+        throw "找不到 extensions.json（-JsonPath）：$JsonPath"
     }
-    (Get-Content $JsonPath -Raw | ConvertFrom-Json) |
+
+    foreach ($path in $DefaultJsonCandidates) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+
+    throw "找不到 extensions.json。已尝试路径：`n - $($DefaultJsonCandidates -join "`n - ")"
+}
+
+function Get-ExtensionsFromJson {
+    $resolvedJsonPath = Resolve-ExtensionsJsonPath
+    Write-Host "📄 使用 extensions.json：$resolvedJsonPath"
+
+    (Get-Content $resolvedJsonPath -Raw | ConvertFrom-Json) |
         ForEach-Object { $_.identifier.id } |
         Sort-Object -Unique
 }
@@ -150,6 +173,28 @@ function Get-LatestVsixInfo($ExtensionId) {
     }
 }
 
+function Remove-OldVsixVersions {
+    param (
+        [string]$Publisher,
+        [string]$Name,
+        [string]$KeepFileName
+    )
+
+    $pattern = "$Publisher.$Name-*.vsix"
+    $candidates = Get-ChildItem -Path $OutDir -File -Filter $pattern -ErrorAction SilentlyContinue
+    $removed = 0
+
+    foreach ($item in $candidates) {
+        if ($item.Name -ne $KeepFileName) {
+            Remove-Item -Path $item.FullName -Force
+            $removed++
+            Write-Host "  清理旧版 $($item.Name)" -ForegroundColor DarkYellow
+        }
+    }
+
+    return $removed
+}
+
 # ------------------------------------------------------------
 # 下载
 # ------------------------------------------------------------
@@ -157,7 +202,12 @@ function Get-LatestVsixInfo($ExtensionId) {
 Write-Host ""
 Write-Host "⬇️  开始下载 [$Mode] 扩展" -ForegroundColor Cyan
 Write-Host "📁 输出目录: $OutDir"
+if ($PruneOldVersions) {
+    Write-Host "🧹 清理策略: 保留每个扩展最新版本（删除旧版）" -ForegroundColor Cyan
+}
 Write-Host ""
+
+$totalRemoved = 0
 
 foreach ($id in $Extensions) {
 
@@ -170,15 +220,18 @@ foreach ($id in $Extensions) {
 
         if (Test-Path $path) {
             Write-Host "  已存在，跳过" -ForegroundColor Yellow
-            continue
+        } else {
+            $url = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/$($info.Publisher)/vsextensions/$($info.Name)/$($info.Version)/vspackage"
+
+            Invoke-WebRequest -Uri $url -OutFile $path
+            Write-Host "  下载完成 $file" -ForegroundColor Green
+
+            Start-Sleep -Seconds $SleepSeconds
         }
 
-        $url = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/$($info.Publisher)/vsextensions/$($info.Name)/$($info.Version)/vspackage"
-
-        Invoke-WebRequest -Uri $url -OutFile $path
-        Write-Host "  下载完成 $file" -ForegroundColor Green
-
-        Start-Sleep -Seconds $SleepSeconds
+        if ($PruneOldVersions) {
+            $totalRemoved += Remove-OldVsixVersions -Publisher $info.Publisher -Name $info.Name -KeepFileName $file
+        }
     }
     catch {
         Write-Host "  下载失败 $id" -ForegroundColor Red
@@ -188,3 +241,6 @@ foreach ($id in $Extensions) {
 
 Write-Host ""
 Write-Host "✅ [$Mode] 扩展下载完成" -ForegroundColor Green
+if ($PruneOldVersions) {
+    Write-Host "🧹 共清理旧版文件: $totalRemoved" -ForegroundColor Green
+}

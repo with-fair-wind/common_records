@@ -10,6 +10,7 @@ param(
     [int]$ThrottleLimit = 6,
     [switch]$DryRun,
     [string]$LogDir = (Join-Path $PSScriptRoot "logs"),
+    [string[]]$SkipRepos = @(),
     [switch]$NoPause
 )
 
@@ -41,6 +42,14 @@ $nestedRepoGroups = @(
     "InternalCmds",
     "Resources",
     "SDKInc"
+)
+
+# 默认跳过仓库（相对 MainDir），可直接在这里维护
+# 示例：
+#   "BIM\zwbm"
+#   "Resources\SomeRepo"
+$defaultSkipRepos = @(
+    "BIM\zwbm"
 )
 
 if (-not (Test-Path -Path $MainDir -PathType Container)) {
@@ -90,6 +99,24 @@ function Get-RepoTargets {
     }
 
     return $targets
+}
+
+function Get-RepoRelativePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $repoFull = [System.IO.Path]::GetFullPath($RepoPath).TrimEnd('\', '/')
+
+    if ($repoFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $relative = $repoFull.Substring($rootFull.Length).TrimStart('\', '/')
+        if (-not $relative) { return "." }
+        return $relative.Replace('/', '\')
+    }
+
+    return $repoFull.Replace('/', '\')
 }
 
 function Invoke-GitStep {
@@ -262,8 +289,39 @@ function Invoke-GitStepParallel {
     return $results
 }
 
-$targets = Get-RepoTargets -Root $MainDir
+$skipSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($item in $defaultSkipRepos) {
+    if ($item) {
+        [void]$skipSet.Add($item.Trim().Replace('/', '\'))
+    }
+}
+foreach ($item in $SkipRepos) {
+    if ($item) {
+        [void]$skipSet.Add($item.Trim().Replace('/', '\'))
+    }
+}
+
+$rawTargets = Get-RepoTargets -Root $MainDir
+$targets = New-Object System.Collections.Generic.List[string]
+$skippedTargets = New-Object System.Collections.Generic.List[string]
+
+foreach ($repo in $rawTargets) {
+    $relativeRepo = Get-RepoRelativePath -Root $MainDir -RepoPath $repo
+    if ($skipSet.Contains($relativeRepo)) {
+        $skippedTargets.Add($relativeRepo) | Out-Null
+    }
+    else {
+        $targets.Add($repo) | Out-Null
+    }
+}
+
 Write-Log -Message "Target repositories: $($targets.Count)"
+if ($skippedTargets.Count -gt 0) {
+    Write-Log -Level "WARN" -Message "Skipped repositories: $($skippedTargets.Count)"
+    foreach ($item in $skippedTargets) {
+        Write-Log -Level "WARN" -Message "skip=$item"
+    }
+}
 Write-Log -Message "Mode=$Mode, Branch=$Branch, Remote=$Remote, RetryCount=$RetryCount, Parallel=$($Parallel.IsPresent), DryRun=$($DryRun.IsPresent)"
 
 $allResults = New-Object System.Collections.Generic.List[object]
