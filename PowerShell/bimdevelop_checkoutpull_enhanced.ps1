@@ -33,7 +33,8 @@ $directRepos = @(
     "PointCloudServices",
     "Ribbon",
     "RuntimeX",
-    "ZwImageCore"
+    "ZwImageCore",
+    "3DModeling"
 )
 
 $nestedRepoGroups = @(
@@ -49,7 +50,8 @@ $nestedRepoGroups = @(
 #   "BIM\zwbm"
 #   "Resources\SomeRepo"
 $defaultSkipRepos = @(
-    "BIM\zwbm"
+    "BIM\ZwBm",
+    "BIm\BmDb"
 )
 
 if (-not (Test-Path -Path $MainDir -PathType Container)) {
@@ -73,8 +75,8 @@ function Write-Log {
     Add-Content -Path $script:logFile -Value $line
     switch ($Level) {
         "ERROR" { Write-Host $line -ForegroundColor Red }
-        "WARN"  { Write-Host $line -ForegroundColor Yellow }
-        "OK"    { Write-Host $line -ForegroundColor Green }
+        "WARN" { Write-Host $line -ForegroundColor Yellow }
+        "OK" { Write-Host $line -ForegroundColor Green }
         default { Write-Host $line }
     }
 }
@@ -137,11 +139,11 @@ function Invoke-GitStep {
         Write-Log -Level "INFO" -Message "DryRun: [$RepoPath] git $($gitArgs -join ' ')"
         return [pscustomobject]@{
             RepoPath = $RepoPath
-            Step = $Step
-            Success = $true
+            Step     = $Step
+            Success  = $true
             ExitCode = 0
             Attempts = 0
-            Command = "git $($gitArgs -join ' ')"
+            Command  = "git $($gitArgs -join ' ')"
         }
     }
 
@@ -159,12 +161,12 @@ function Invoke-GitStep {
             Write-Log -Level "OK" -Message "[$Step] success: $RepoPath (attempt $attempt/$maxAttempts)"
             return [pscustomobject]@{
                 RepoPath = $RepoPath
-                Step = $Step
-                Success = $true
+                Step     = $Step
+                Success  = $true
                 ExitCode = 0
                 Attempts = $attempt
-                Command = "git $($gitArgs -join ' ')"
-                Output = ($output | Out-String).Trim()
+                Command  = "git $($gitArgs -join ' ')"
+                Output   = ($output | Out-String).Trim()
             }
         }
 
@@ -175,12 +177,12 @@ function Invoke-GitStep {
         else {
             return [pscustomobject]@{
                 RepoPath = $RepoPath
-                Step = $Step
-                Success = $false
+                Step     = $Step
+                Success  = $false
                 ExitCode = $code
                 Attempts = $attempt
-                Command = "git $($gitArgs -join ' ')"
-                Output = ($output | Out-String).Trim()
+                Command  = "git $($gitArgs -join ' ')"
+                Output   = ($output | Out-String).Trim()
             }
         }
     }
@@ -206,65 +208,65 @@ function Invoke-GitStepParallel {
 
         $jobs = foreach ($repo in $batch) {
             Start-ThreadJob -Name "$Step::$repo" -ScriptBlock {
-            param($RepoPath, $StepName, $BranchName, $RemoteName, $MaxRetry, $RetryDelay, $UseDryRun)
+                param($RepoPath, $StepName, $BranchName, $RemoteName, $MaxRetry, $RetryDelay, $UseDryRun)
 
-            $maxAttempts = [Math]::Max(1, $MaxRetry + 1)
-            $gitArgs = if ($StepName -eq "checkout") {
-                @("checkout", $BranchName)
-            }
-            else {
-                @("pull", "--progress", "-v", "--no-rebase", $RemoteName, $BranchName)
-            }
-
-            if ($UseDryRun) {
-                return [pscustomobject]@{
-                    RepoPath = $RepoPath
-                    Step = $StepName
-                    Success = $true
-                    ExitCode = 0
-                    Attempts = 0
-                    Command = "git $($gitArgs -join ' ')"
-                    Output = "DryRun"
-                }
-            }
-
-            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-                try {
-                    Push-Location $RepoPath
-                    $output = & git @gitArgs 2>&1
-                    $code = $LASTEXITCODE
-                }
-                finally {
-                    Pop-Location
-                }
-
-                if ($code -eq 0) {
-                    return [pscustomobject]@{
-                        RepoPath = $RepoPath
-                        Step = $StepName
-                        Success = $true
-                        ExitCode = 0
-                        Attempts = $attempt
-                        Command = "git $($gitArgs -join ' ')"
-                        Output = ($output | Out-String).Trim()
-                    }
-                }
-
-                if ($attempt -lt $maxAttempts) {
-                    Start-Sleep -Seconds $RetryDelay
+                $maxAttempts = [Math]::Max(1, $MaxRetry + 1)
+                $gitArgs = if ($StepName -eq "checkout") {
+                    @("checkout", $BranchName)
                 }
                 else {
+                    @("pull", "--progress", "-v", "--no-rebase", $RemoteName, $BranchName)
+                }
+
+                if ($UseDryRun) {
                     return [pscustomobject]@{
                         RepoPath = $RepoPath
-                        Step = $StepName
-                        Success = $false
-                        ExitCode = $code
-                        Attempts = $attempt
-                        Command = "git $($gitArgs -join ' ')"
-                        Output = ($output | Out-String).Trim()
+                        Step     = $StepName
+                        Success  = $true
+                        ExitCode = 0
+                        Attempts = 0
+                        Command  = "git $($gitArgs -join ' ')"
+                        Output   = "DryRun"
                     }
                 }
-            }
+
+                for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                    try {
+                        Push-Location $RepoPath
+                        $output = & git @gitArgs 2>&1
+                        $code = $LASTEXITCODE
+                    }
+                    finally {
+                        Pop-Location
+                    }
+
+                    if ($code -eq 0) {
+                        return [pscustomobject]@{
+                            RepoPath = $RepoPath
+                            Step     = $StepName
+                            Success  = $true
+                            ExitCode = 0
+                            Attempts = $attempt
+                            Command  = "git $($gitArgs -join ' ')"
+                            Output   = ($output | Out-String).Trim()
+                        }
+                    }
+
+                    if ($attempt -lt $maxAttempts) {
+                        Start-Sleep -Seconds $RetryDelay
+                    }
+                    else {
+                        return [pscustomobject]@{
+                            RepoPath = $RepoPath
+                            Step     = $StepName
+                            Success  = $false
+                            ExitCode = $code
+                            Attempts = $attempt
+                            Command  = "git $($gitArgs -join ' ')"
+                            Output   = ($output | Out-String).Trim()
+                        }
+                    }
+                }
             } -ArgumentList $repo, $Step, $Branch, $Remote, $RetryCount, $RetryDelaySeconds, $DryRun.IsPresent
         }
 
