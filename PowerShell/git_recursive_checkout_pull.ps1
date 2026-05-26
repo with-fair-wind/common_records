@@ -122,13 +122,14 @@ function Find-GitRepos {
     if ($CurrentDepth -gt $MaxDepth) { return }
 
     $gitDir = Join-Path $Path ".git"
-    if (Test-Path $gitDir) {
+    $isGitRepo = Test-Path $gitDir
+
+    if ($isGitRepo) {
         [PSCustomObject]@{
             Path         = $Path
             Name         = Split-Path $Path -Leaf
             RelativePath = Get-RelativePath -BasePath $MainDir -TargetPath $Path
         }
-        return
     }
 
     $children = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
