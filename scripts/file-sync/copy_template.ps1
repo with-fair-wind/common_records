@@ -698,12 +698,22 @@ $tasks = @(
 
     @{
         Title     = '拷贝VS2022离线安装包'
-        Enabled   = $true  # 设为 $true 启用该任务
+        Enabled   = $false  # 设为 $true 启用该任务
         SourceDir = 'F:\VS2022Offline'
         DestDirs  = @(
             'D:\install\VS2022Offline'
         )
         Mode      = 'Mirror'  # 同步模式，保留额外文件
+    }
+
+    @{
+        Title     = 'VS2026离线安装包同步'
+        Enabled   = $true  # 设为 $true 启用该任务
+        SourceDir = 'F:\VS2026Offline'
+        DestDirs  = @(
+            'D:\install\VS2026Offline'
+        )
+        Mode      = 'Mirror'  # 镜像模式，会删除目标目录中多余的文件
     }
 )
 

@@ -1,1 +1,12 @@
+# Generated extension packages
 **/vsix/
+
+# Generated editor extension lists
+**/extensions-cursor.txt
+**/extensions-vscode.txt
+
+# Local editor state
+.vscode/extensions.json
+
+# Script runtime logs
+**/logs/
