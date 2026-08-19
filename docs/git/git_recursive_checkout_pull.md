@@ -195,7 +195,7 @@ if ($LASTEXITCODE -ne 0) {
    - 自动跳过 node_modules / .vs / .idea / __pycache__ 等目录
 4. 应用排除规则过滤仓库列表
 5. 根据 Mode 执行操作：
-   - CheckoutOnly / All → git checkout <Branch>
+   - CheckoutOnly / All → 先 `git fetch <Remote>` 同步远程引用；本地已有该分支则 `git checkout <Branch>`，本地没有则 `git checkout -b <Branch> --track <Remote>/<Branch>` 从远程建立跟踪分支并切换（fetch 失败不中断：记 WARN 日志后继续尝试 checkout，顺序/并行模式行为一致）
    - PullOnly / All     → git pull --no-rebase <Remote> <Branch>
 6. 失败时按 RetryCount 自动重试，间隔 RetryDelaySeconds
 7. 输出汇总报告，写入日志文件
@@ -296,6 +296,7 @@ git_checkout_pull_YYYYMMDD_HHmmss.log
 [10:30:01] [WARN ] ZwBm | 排除: BIM\ZwBm
 [10:30:02] [OK   ] IMModeling | checkout OK | Already on 'developbim'
 [10:30:03] [OK   ] AppFx | checkout OK | Switched to branch 'developbim'
+[10:30:04] [WARN ] ZwTools | fetch origin 失败（继续尝试 checkout）: fatal: unable to access 'https://git.example.com/ZwTools.git/': Failed to connect
 [10:30:15] [ERROR] ZwTools | pull 失败 (exit=1, 共尝试 3 次)
 [10:31:05] [INFO ] 执行完毕 | 成功=44 | 失败=2 | 跳过=2 | 耗时=01:04
 ```
@@ -353,9 +354,13 @@ Install-Module -Name ThreadJob -Scope CurrentUser
 
 或者不使用 `-Parallel` 参数，脚本会自动顺序执行。
 
-### Q: 某些仓库没有目标分支怎么办？
+### Q: 某些仓库本地没有目标分支怎么办？
 
-脚本会报告 checkout 失败，该仓库的 pull 仍会尝试执行（Mode=All 时）。建议先用 `-DryRun` 确认仓库列表，或用 `-ExcludePatterns` 排除不相关的仓库。
+checkout 前会先 `git fetch`：只要**远程存在该分支**，脚本就会用 `git checkout -b <Branch> --track <Remote>/<Branch>` 在本地自动建立跟踪分支并切换，无需手动创建。只有当远程也没有该分支时才会报 checkout 失败（Mode=All 时该仓库的 pull 仍会尝试执行）。可先用 `-DryRun` 确认，或用 `-ExcludePatterns` 排除不相关的仓库。
+
+### Q: checkout 前的 fetch 失败会怎样？
+
+不会中断。脚本记一条 WARN 日志（含 git 报错详情）后继续尝试 checkout：本地已有目标分支时正常切换；本地没有且旧的远程引用中也找不到该分支时，checkout 才会失败并进入重试。顺序与并行模式行为一致。排查时在日志文件中搜索 `fetch .* 失败`，可定位是哪个仓库因网络、远程名或认证问题没同步到最新远程引用。
 
 ### Q: 如何只查看会操作哪些仓库？
 

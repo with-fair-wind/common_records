@@ -171,15 +171,35 @@ function Invoke-GitOperation {
         [string]$Operation
     )
 
-    $gitArgs = if ($Operation -eq "checkout") {
-        @("checkout", $Branch)
-    } else {
-        @("pull", "--no-rebase", $Remote, $Branch)
+    if ($DryRun) {
+        if ($Operation -eq "checkout") {
+            Write-Status -RepoName $RepoName -Message "DRY RUN: git fetch $Remote; git checkout $Branch (本地无此分支时自动 -b --track $Remote/$Branch)" -Level "INFO"
+        } else {
+            Write-Status -RepoName $RepoName -Message "DRY RUN: git pull --no-rebase $Remote $Branch" -Level "INFO"
+        }
+        return $true
     }
 
-    if ($DryRun) {
-        Write-Status -RepoName $RepoName -Message "DRY RUN: git $($gitArgs -join ' ')" -Level "INFO"
-        return $true
+    if ($Operation -eq "checkout") {
+        # 先 fetch 保证远程引用最新；本地无此分支则从远程建立跟踪分支，否则直接切换
+        Push-Location $RepoPath
+        try {
+            $fetchOut = & git fetch $Remote --quiet 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log -Message "$RepoName | fetch $Remote 失败（继续尝试 checkout）: $(($fetchOut | Out-String).Trim())" -Level "WARN"
+            }
+            & git show-ref --verify --quiet "refs/heads/$Branch"
+            $localExists = ($LASTEXITCODE -eq 0)
+        } finally {
+            Pop-Location
+        }
+        $gitArgs = if ($localExists) {
+            @("checkout", $Branch)
+        } else {
+            @("checkout", "-b", $Branch, "--track", "$Remote/$Branch")
+        }
+    } else {
+        $gitArgs = @("pull", "--no-rebase", $Remote, $Branch)
     }
 
     $maxAttempts = $RetryCount + 1
@@ -236,18 +256,35 @@ function Invoke-GitOperationParallel {
             Start-ThreadJob -Name "$Operation::$($repo.Name)" -ScriptBlock {
                 param($RepoPath, $RepoName, $Op, $BranchName, $RemoteName, $MaxRetry, $RetryDelay, $UseDryRun)
 
-                $gitArgs = if ($Op -eq "checkout") {
-                    @("checkout", $BranchName)
-                } else {
-                    @("pull", "--no-rebase", $RemoteName, $BranchName)
-                }
-
                 if ($UseDryRun) {
                     return [PSCustomObject]@{
                         RepoName = $RepoName; RepoPath = $RepoPath
                         Operation = $Op; Success = $true; ExitCode = 0
                         Attempts = 0; Output = "DRY RUN"
                     }
+                }
+
+                $fetchWarn = $null
+                if ($Op -eq "checkout") {
+                    # 先 fetch 保证远程引用最新；本地无此分支则从远程建立跟踪分支，否则直接切换
+                    Push-Location $RepoPath
+                    try {
+                        $fetchOut = & git fetch $RemoteName --quiet 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            $fetchWarn = "fetch $RemoteName 失败（继续尝试 checkout）: $(($fetchOut | Out-String).Trim())"
+                        }
+                        & git show-ref --verify --quiet "refs/heads/$BranchName"
+                        $localExists = ($LASTEXITCODE -eq 0)
+                    } finally {
+                        Pop-Location
+                    }
+                    $gitArgs = if ($localExists) {
+                        @("checkout", $BranchName)
+                    } else {
+                        @("checkout", "-b", $BranchName, "--track", "$RemoteName/$BranchName")
+                    }
+                } else {
+                    $gitArgs = @("pull", "--no-rebase", $RemoteName, $BranchName)
                 }
 
                 $maxAttempts = $MaxRetry + 1
@@ -265,6 +302,7 @@ function Invoke-GitOperationParallel {
                             RepoName = $RepoName; RepoPath = $RepoPath
                             Operation = $Op; Success = $true; ExitCode = 0
                             Attempts = $attempt; Output = ($output | Out-String).Trim()
+                            FetchWarning = $fetchWarn
                         }
                     }
 
@@ -275,6 +313,7 @@ function Invoke-GitOperationParallel {
                     RepoName = $RepoName; RepoPath = $RepoPath
                     Operation = $Op; Success = $false; ExitCode = $code
                     Attempts = $maxAttempts; Output = ($output | Out-String).Trim()
+                    FetchWarning = $fetchWarn
                 }
             } -ArgumentList $repo.Path, $repo.Name, $Operation, $Branch, $Remote, $RetryCount, $RetryDelaySeconds, $DryRun.IsPresent
         }
@@ -284,6 +323,9 @@ function Invoke-GitOperationParallel {
         Remove-Job -Job $jobs -Force | Out-Null
 
         foreach ($r in $batchResults) {
+            if ($r.FetchWarning) {
+                Write-Log -Message "$($r.RepoName) | $($r.FetchWarning)" -Level "WARN"
+            }
             if ($r.Success) {
                 $brief = $r.Output.Split("`n")[0]
                 if ($brief.Length -gt 50) { $brief = $brief.Substring(0, 50) + "..." }
