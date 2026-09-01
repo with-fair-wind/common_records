@@ -154,11 +154,21 @@ function Get-RelativePath {
 function Test-ShouldExclude {
     param([string]$RelativePath)
 
+    # 顶层仓库（MainDir 本身）的相对路径为 "."，不是目录名，任何目录名规则都匹配不到它；
+    # 这里额外用 MainDir 的目录名参与匹配，方便直接用目录名排除顶层仓库
+    $matchTargets = @($RelativePath)
+    if ($RelativePath -eq ".") {
+        $topLeaf = Split-Path $MainDir -Leaf
+        if ($topLeaf -and $matchTargets -notcontains $topLeaf) { $matchTargets += $topLeaf }
+    }
+
     $allPatterns = $defaultExcludePatterns + $ExcludePatterns
     foreach ($pattern in $allPatterns) {
         if (-not $pattern) { continue }
         $normalized = $pattern.Trim().Replace('/', '\')
-        if ($RelativePath -like "*$normalized*") { return $true }
+        foreach ($target in $matchTargets) {
+            if ($target -like "*$normalized*") { return $true }
+        }
     }
     return $false
 }
