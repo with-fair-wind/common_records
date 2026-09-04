@@ -1,212 +1,74 @@
 # git_recursive_checkout_pull.ps1 使用文档
 
-## 概述
+## 1. 脚本职责
 
-递归扫描指定目录下的所有 Git 仓库，批量执行 `checkout` 切换分支和 `pull` 拉取更新。
+`git_recursive_checkout_pull.ps1` 用于在指定目录中安全地批量同步多个 Git 仓库：
 
-适用于管理大量子仓库的工作流（如多模块 C++ 项目、微服务集群、monorepo 等）。脚本不依赖硬编码仓库列表，通过自动发现 `.git` 目录来识别仓库，适配任意目录结构。
+- 主仓库使用命令行参数指定的目标分支。
+- 已初始化的子模块优先使用直接父仓库 `.gitmodules` 中声明的分支。
+- 未声明子模块分支时，回退到主仓库目标分支。
+- 可选择同时处理目录树中的独立嵌套仓库，或者只处理主仓库和正式子模块。
+- 父仓库成功后才处理其子模块；checkout 失败后不会继续 pull。
+- 输出终端汇总、日志和可供自动化调用的退出码。
 
----
+该脚本执行的是“按分支 checkout/pull”，不是 `git submodule update` 的替代品。
 
-## 环境要求
+## 2. 不负责的功能
+
+脚本不会：
+
+- 克隆主仓库。
+- 初始化未初始化的子模块。
+- 按父仓库记录的 gitlink commit 检出子模块。
+- 自动创建远程分支。
+- 自动 stash、commit、reset 或丢弃本地修改。
+- 自动解决 checkout、merge 或 pull 冲突。
+- 删除失效的子模块目录。
+
+本地修改阻止 checkout 或 pull 时，操作会失败并保留现场。
+
+## 3. 环境要求
 
 | 依赖 | 要求 |
-|------|------|
-| PowerShell | 5.1+ 或 PowerShell 7+ |
-| Git | 已安装且在 PATH 中 |
-| ThreadJob 模块 | 并行模式需要（`Install-Module ThreadJob`），不可用时自动回退顺序执行 |
+|---|---|
+| PowerShell | PowerShell 7.0+；不支持 Windows PowerShell 5.x |
+| Git | 已安装并加入 `PATH` |
+| ThreadJob | 仅并行模式需要；不可用时自动回退顺序执行 |
+| PSScriptAnalyzer | 仅开发检查需要；已验证 1.25.0 |
+| Pester | 仅集成测试需要；要求 5.6.1+，已验证 6.1.0 |
 
----
-
-## 参数说明
+## 4. 参数
 
 | 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `-MainDir` | string | 当前目录下的 `main` | 主目录路径，从此目录开始递归扫描 Git 仓库 |
-| `-Branch` | string | `developbim` | 要 checkout/pull 的目标分支名 |
+|---|---|---|---|
+| `-MainDir` | string | 当前目录下的 `main` | 扫描根目录；如果它本身是 Git 仓库，则作为主仓库 |
+| `-Branch` | string | `developbim` | 主仓库和独立仓库的目标分支，也是子模块分支回退值 |
 | `-Remote` | string | `origin` | 远程仓库名称 |
-| `-Mode` | enum | `All` | 执行模式：`All` / `CheckoutOnly` / `PullOnly` |
-| `-RetryCount` | int | `2` | 失败后重试次数（实际最大尝试次数 = RetryCount + 1） |
-| `-RetryDelaySeconds` | int | `2` | 两次重试之间的等待秒数 |
-| `-Parallel` | switch | 否 | 启用并行执行（基于 ThreadJob） |
-| `-ThrottleLimit` | int | `6` | 并行模式下每批并发数量 |
-| `-DryRun` | switch | 否 | 预演模式，仅显示将执行的命令而不实际运行 |
-| `-LogDir` | string | 脚本目录下 `logs/` | 日志文件输出目录，不存在则自动创建 |
-| `-ExcludePatterns` | string[] | 空 | 运行时追加的排除规则（通配符匹配相对路径） |
-| `-MaxDepth` | int | `5` | 递归扫描的最大目录深度 |
-| `-NoPause` | switch | 否 | 执行完毕后不等待用户按 Enter（适合脚本/CI 调用） |
+| `-Mode` | enum | `All` | `All`、`CheckoutOnly` 或 `PullOnly` |
+| `-RetryCount` | int | `2` | 远端检查和 fetch 的重试次数；最大尝试次数为此值加一 |
+| `-RetryDelaySeconds` | int | `2` | 重试间隔秒数 |
+| `-Parallel` | switch | 否 | 并行处理同一层级、互不依赖的仓库 |
+| `-ThrottleLimit` | int | `6` | 并行批次大小，必须大于零 |
+| `-DryRun` | switch | 否 | fetch 并生成执行计划，但不 checkout 或 pull |
+| `-LogDir` | string | 脚本目录下的 `logs` | 日志目录，不存在时自动创建 |
+| `-ExcludePatterns` | string[] | 空 | 追加路径排除规则 |
+| `-MaxDepth` | int | `5` | 文件系统递归扫描深度 |
+| `-SubmodulesOnly` | switch | 否 | 跳过非主仓库、非子模块的独立仓库 |
+| `-NoPause` | switch | 否 | 完成后不等待 Enter，适用于 CI 或其他脚本调用 |
 
-### Mode 模式说明
+数值参数会在绑定阶段校验：重试次数、间隔和深度不能为负数，并发数必须大于零。
 
-| 模式 | 行为 |
-|------|------|
-| `All` | 先对所有仓库执行 checkout，再执行 pull |
-| `CheckoutOnly` | 仅切换分支，不拉取 |
-| `PullOnly` | 仅拉取，不切换分支（适合已在正确分支时使用） |
+## 5. 仓库发现与分类
 
----
+脚本从 `MainDir` 开始扫描当前已经存在的 `.git` 目录或文件，并分类为：
 
-## 排除机制
+| 类型 | 判定方式 | 分支规则 |
+|---|---|---|
+| `Main` | 仓库路径等于 `MainDir` | 使用 `-Branch` |
+| `Submodule` | Git 报告了直接 superproject，并且该父仓库位于扫描根目录内 | 读取父仓库 `.gitmodules` |
+| `Standalone` | 位于目录树中，但不是 Git 子模块 | 使用 `-Branch` |
 
-脚本支持两层排除：
-
-### 1. 内置默认排除
-
-在脚本 `$defaultExcludePatterns` 中维护，可直接编辑：
-
-```powershell
-$defaultExcludePatterns = @(
-    "BIM\ZwBm",
-    "BIM\BmDb"
-)
-```
-
-### 2. 运行时排除
-
-通过 `-ExcludePatterns` 参数传入，与默认排除合并生效：
-
-```powershell
-.\git_recursive_checkout_pull.ps1 -ExcludePatterns "ThirdParty*","Test\MockRepo"
-```
-
-### 匹配规则
-
-- 排除规则使用 PowerShell `-like` 通配符匹配
-- 匹配目标是仓库相对于 `MainDir` 的**相对路径**
-- 支持 `*`（任意字符）和 `?`（单字符）通配符
-- 路径分隔符使用 `\`（Windows）
-- `MainDir` 本身是 git 仓库时，其相对路径为 `.`，脚本会额外用 `MainDir` 的目录名参与匹配——直接用目录名（如 `main`）即可排除顶层仓库
-
-### 示例
-
-假设目录结构：
-
-```
-MainDir/
-├── BIM/
-│   ├── ZwBm/       <- 被默认排除
-│   ├── BmDb/       <- 被默认排除
-│   └── Core/
-├── Tools/
-│   ├── BuildTool/
-│   └── TestHelper/
-└── ThirdParty/
-    └── LibX/
-```
-
-- 排除 `"BIM\ZwBm"` → 匹配路径包含 `BIM\ZwBm` 的仓库
-- 排除 `"ThirdParty*"` → 匹配路径包含 `ThirdParty` 开头的仓库
-- 排除 `"*Tool*"` → 匹配路径包含 `Tool` 的所有仓库
-
----
-
-## 使用示例
-
-### 基本用法
-
-```powershell
-# 使用全部默认值（在 .\main 下扫描，checkout + pull developbim）
-.\git_recursive_checkout_pull.ps1
-
-# 指定目录和分支
-.\git_recursive_checkout_pull.ps1 -MainDir "D:\projects\myapp" -Branch "master"
-
-# 指定远程
-.\git_recursive_checkout_pull.ps1 -MainDir "D:\work\main" -Remote "upstream" -Branch "develop"
-```
-
-### 模式控制
-
-```powershell
-# 只切换分支不拉取
-.\git_recursive_checkout_pull.ps1 -Branch "feature/new-ui" -Mode CheckoutOnly
-
-# 只拉取不切换分支（已在目标分支时使用）
-.\git_recursive_checkout_pull.ps1 -Mode PullOnly
-
-# 完整流程（默认）
-.\git_recursive_checkout_pull.ps1 -Mode All
-```
-
-### 并行执行
-
-```powershell
-# 启用并行，默认 6 并发
-.\git_recursive_checkout_pull.ps1 -Parallel
-
-# 8 并发
-.\git_recursive_checkout_pull.ps1 -Parallel -ThrottleLimit 8
-
-# 小批量并发（网络较慢时）
-.\git_recursive_checkout_pull.ps1 -Parallel -ThrottleLimit 3
-```
-
-### 排除仓库
-
-```powershell
-# 排除单个仓库
-.\git_recursive_checkout_pull.ps1 -ExcludePatterns "Tools\BuildTool"
-
-# 排除多个
-.\git_recursive_checkout_pull.ps1 -ExcludePatterns "ThirdParty*","Test\MockRepo","*Deprecated*"
-```
-
-### 安全与调试
-
-```powershell
-# 模拟运行 — 查看会操作哪些仓库，不实际执行 git 命令
-.\git_recursive_checkout_pull.ps1 -DryRun
-
-# 浅层扫描（只看 2 层深度）
-.\git_recursive_checkout_pull.ps1 -MaxDepth 2
-
-# 增加重试（网络不稳定时）
-.\git_recursive_checkout_pull.ps1 -RetryCount 5 -RetryDelaySeconds 5
-```
-
-### CI / 自动化环境
-
-```powershell
-# 不等待回车，适合脚本调用
-.\git_recursive_checkout_pull.ps1 -MainDir "D:\work\main" -Branch "release/2.0" -Parallel -NoPause
-
-# 配合退出码判断
-.\git_recursive_checkout_pull.ps1 -NoPause
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "部分仓库操作失败，请检查日志"
-    exit 1
-}
-```
-
-### 自定义日志位置
-
-```powershell
-.\git_recursive_checkout_pull.ps1 -LogDir "C:\logs\git_ops"
-```
-
----
-
-## 工作流程
-
-```
-1. 验证 MainDir 是否存在
-2. 创建日志目录和日志文件
-3. 递归扫描 MainDir，识别含 .git 的目录为仓库
-   - 发现 .git 即标记为仓库，不再深入其子目录
-   - 自动跳过 node_modules / .vs / .idea / __pycache__ 等目录
-4. 应用排除规则过滤仓库列表
-5. 根据 Mode 执行操作：
-   - CheckoutOnly / All → 先 `git fetch <Remote>` 同步远程引用；本地已有该分支则 `git checkout <Branch>`，本地没有则 `git checkout -b <Branch> --track <Remote>/<Branch>` 从远程建立跟踪分支并切换（fetch 失败不中断：记 WARN 日志后继续尝试 checkout，顺序/并行模式行为一致）
-   - PullOnly / All     → git pull --no-rebase <Remote> <Branch>
-6. 失败时按 RetryCount 自动重试，间隔 RetryDelaySeconds
-7. 输出汇总报告，写入日志文件
-```
-
----
-
-## 自动跳过的目录
-
-递归扫描时自动跳过以下目录（不会深入扫描）：
+扫描会跳过以下普通目录：
 
 - `node_modules`
 - `.git`
@@ -214,171 +76,278 @@ if ($LASTEXITCODE -ne 0) {
 - `.vs`
 - `.idea`
 
----
-
-## 输出格式
-
-### 状态图标
-
-| 图标 | 颜色 | 含义 |
-|------|------|------|
-| `[+]` | 绿色 | 操作成功 |
-| `[X]` | 红色 | 操作失败 |
-| `[-]` | 黄色 | 已排除/跳过 |
-| `[!]` | 黄色 | 警告（如重试中） |
-| `[*]` | 白色 | 普通信息 |
-
-### 输出示例
-
-```
-╔══════════════════════════════════════════════════════════════════════╗
-║                      Git 批量 Checkout & Pull                       ║
-╚══════════════════════════════════════════════════════════════════════╝
-
-  主目录:     D:\work\main
-  目标分支:   developbim
-  远程:       origin
-  模式:       All
-  重试次数:   2
-  重试间隔:   2s
-  并行执行:   否
-  最大深度:   5
-
-── 扫描 Git 仓库 ──────────────────────────────────────────────────────
-
-  发现 25 个 Git 仓库，排除 2 个，将处理 23 个
-
-  [-] ZwBm                         排除: BIM\ZwBm
-  [-] BmDb                         排除: BIM\BmDb
-
-── Checkout -> developbim (23 个仓库) ─────────────────────────────────
-  (1/23) [+] IMModeling                  checkout OK | Already on 'developbim'
-  (2/23) [+] AppFx                       checkout OK | Switched to branch 'developbim'
-  (3/23) [!] ZwTools                     checkout 失败 (第 1 次)，2s 后重试...
-  (3/23) [+] ZwTools                     checkout OK | Switched to branch 'developbim'
-
-── Pull origin/developbim (23 个仓库) ─────────────────────────────────
-  (1/23) [+] IMModeling                  pull OK | Already up to date.
-  (2/23) [+] AppFx                       pull OK | Updating 3a2b1c0..5d6e7f8
-
-══════════════════════════════════════════════════════════════════════════
-
-  汇总报告
-
-    成功:   46
-    失败:   0
-    跳过:   2
-    耗时:   01:23
-
-  所有操作均已成功完成！
-
-  日志: D:\work\main\logs\git_checkout_pull_20260526_103001.log
-
-══════════════════════════════════════════════════════════════════════════
-```
-
----
-
-## 日志文件
-
-### 位置
-
-日志自动保存在 `LogDir` 目录下，文件名格式：
-
-```
-git_checkout_pull_YYYYMMDD_HHmmss.log
-```
-
-### 日志内容示例
-
-```
-[10:30:01] [INFO ] 开始执行 | 主目录=D:\work\main | 分支=developbim | 远程=origin | 模式=All | 并行=False | DryRun=False
-[10:30:01] [INFO ] 发现 25 个仓库，排除 2 个，处理 23 个
-[10:30:01] [WARN ] ZwBm | 排除: BIM\ZwBm
-[10:30:02] [OK   ] IMModeling | checkout OK | Already on 'developbim'
-[10:30:03] [OK   ] AppFx | checkout OK | Switched to branch 'developbim'
-[10:30:04] [WARN ] ZwTools | fetch origin 失败（继续尝试 checkout）: fatal: unable to access 'https://git.example.com/ZwTools.git/': Failed to connect
-[10:30:15] [ERROR] ZwTools | pull 失败 (exit=1, 共尝试 3 次)
-[10:31:05] [INFO ] 执行完毕 | 成功=44 | 失败=2 | 跳过=2 | 耗时=01:04
-```
-
----
-
-## 退出码
-
-| 值 | 含义 |
-|----|------|
-| `0` | 所有操作成功 |
-| `1` | 存在失败的仓库，或未找到任何仓库 |
-
-可在脚本/CI 中通过 `$LASTEXITCODE` 获取。
-
----
-
-## 适配其他项目
-
-此脚本不依赖任何硬编码仓库列表，可直接用于任意多仓库项目。如需定制：
-
-1. **修改默认分支**：更改参数默认值 `$Branch = "developbim"` 为你的分支名
-2. **修改默认排除**：编辑脚本中 `$defaultExcludePatterns` 数组
-3. **修改默认主目录**：更改 `$MainDir` 默认值
-
-### 支持的目录结构
-
-```
-# 扁平结构
-MainDir/repo1/.git
-MainDir/repo2/.git
-
-# 嵌套分组
-MainDir/group1/repo1/.git
-MainDir/group2/repo2/.git
-
-# 混合深度
-MainDir/repo1/.git
-MainDir/group/subgroup/repo2/.git
-
-# 以上所有结构均可自动识别
-```
-
----
-
-## 常见问题
-
-### Q: 并行模式报错 "Start-ThreadJob 不可用"
-
-安装 ThreadJob 模块：
+内置排除项为：
 
 ```powershell
-Install-Module -Name ThreadJob -Scope CurrentUser
+BIM\ZwBm
+BIM\BmDb
 ```
 
-或者不使用 `-Parallel` 参数，脚本会自动顺序执行。
+`-ExcludePatterns` 会追加到内置规则。规则通过 PowerShell `-like` 对仓库相对路径执行包含式匹配。
 
-### Q: 某些仓库本地没有目标分支怎么办？
-
-checkout 前会先 `git fetch`：只要**远程存在该分支**，脚本就会用 `git checkout -b <Branch> --track <Remote>/<Branch>` 在本地自动建立跟踪分支并切换，无需手动创建。只有当远程也没有该分支时才会报 checkout 失败（Mode=All 时该仓库的 pull 仍会尝试执行）。可先用 `-DryRun` 确认，或用 `-ExcludePatterns` 排除不相关的仓库。
-
-### Q: checkout 前的 fetch 失败会怎样？
-
-不会中断。脚本记一条 WARN 日志（含 git 报错详情）后继续尝试 checkout：本地已有目标分支时正常切换；本地没有且旧的远程引用中也找不到该分支时，checkout 才会失败并进入重试。顺序与并行模式行为一致。排查时在日志文件中搜索 `fetch .* 失败`，可定位是哪个仓库因网络、远程名或认证问题没同步到最新远程引用。
-
-### Q: 如何只查看会操作哪些仓库？
+示例：
 
 ```powershell
-.\git_recursive_checkout_pull.ps1 -DryRun
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -ExcludePatterns "ThirdParty*","Tests\MockRepo"
 ```
 
-### Q: 网络不好导致 pull 经常失败？
+### SubmodulesOnly
 
-增加重试次数和间隔：
+启用 `-SubmodulesOnly` 后：
 
-```powershell
-.\git_recursive_checkout_pull.ps1 -RetryCount 5 -RetryDelaySeconds 10
+- 主仓库继续处理。
+- 已初始化的子模块继续处理。
+- 独立嵌套仓库被跳过。
+- 父仓库目标版本中已移除的子模块被跳过。
+
+脚本不会初始化只登记在 `.gitmodules`、但本地尚未形成 Git 仓库的子模块。
+
+## 6. 子模块目标分支
+
+子模块根据直接父仓库的目标版本解析 `.gitmodules`。
+
+给定：
+
+```ini
+[submodule "render-engine"]
+    path = components/render
+    branch = release
 ```
 
-### Q: 如何在脚本中调用而不阻塞？
+脚本先根据 `path = components/render` 找到配置节名称 `render-engine`，再读取：
+
+```text
+submodule.render-engine.branch
+```
+
+因此子模块名称不要求与路径相同。
+
+完整规则如下：
+
+| `.gitmodules` 状态 | 子模块目标分支 | 汇总来源 |
+|---|---|---|
+| `branch = release` | `release` | `.gitmodules` |
+| `branch = .` | 父仓库的目标分支 | `branch = .` |
+| 未配置 `branch` | `-Branch` 参数 | 回退参数 |
+| 目标版本未登记该路径 | 不再处理该仓库 | 跳过 |
+
+嵌套子模块会逐层解析，因此第二层子模块读取的是第一层父仓库目标版本中的 `.gitmodules`。
+
+## 7. 执行模式
+
+### All
+
+每个仓库先 checkout，成功后才 pull：
+
+```text
+主仓库 checkout
+└── 主仓库 pull
+    └── 第一层子模块 checkout → pull
+        └── 第二层子模块 checkout → pull
+```
+
+安全约束：
+
+- checkout 失败后，同一仓库的 pull 标记为依赖失败，不再执行。
+- 父仓库未成功完成时，子模块及其后代均不执行。
+- 远端分支不存在但本地分支存在时，仍可 checkout 本地分支，pull 被跳过。
+- 远端和本地都没有目标分支时，checkout 被跳过。
+
+### CheckoutOnly
+
+只执行分支切换：
 
 ```powershell
-.\git_recursive_checkout_pull.ps1 -NoPause
+.\git_recursive_checkout_pull.ps1 -Mode CheckoutOnly
+```
+
+本地没有分支但远端存在时，从远端创建跟踪分支。
+
+### PullOnly
+
+只拉取更新：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 -Mode PullOnly
+```
+
+脚本会先检查当前分支是否与目标分支完全一致。分支不一致或处于 detached HEAD 时拒绝 pull，防止把目标分支合并进错误的当前分支。
+
+## 8. 远端分支检查与重试
+
+每次操作会：
+
+1. 验证目标分支名。
+2. 检查指定远程是否存在。
+3. 使用 `git ls-remote --heads` 查询远端真实分支。
+4. 显式 fetch 目标分支到对应的远程跟踪引用。
+5. 执行 checkout 或 pull。
+
+该检查不依赖本地是否已经存在 `refs/remotes/<remote>/<branch>`，因此兼容单分支克隆和受限 fetch refspec。
+
+`RetryCount` 只应用于可能暂时恢复的远端查询和 fetch。checkout 与 pull 不自动重试，避免在冲突或部分合并状态下重复执行。
+
+## 9. 并行处理
+
+启用方式：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 -Parallel -ThrottleLimit 6
+```
+
+并行只发生在同一层级的仓库之间。父仓库与子模块永远不会并行。
+
+顺序和并行模式调用同一个 Git 工作单元，因此具有相同的：
+
+- 分支验证。
+- 远端查询。
+- checkout/pull 安全规则。
+- 结果状态。
+
+如果 `Start-ThreadJob` 不可用，脚本会输出警告并回退到顺序模式。
+
+## 10. DryRun
+
+```powershell
+.\git_recursive_checkout_pull.ps1 -DryRun -NoPause
+```
+
+DryRun 会执行以下只影响 Git 元数据的操作：
+
+- 查询远程分支。
+- fetch 目标分支并更新远程跟踪引用。
+- 从目标引用读取 `.gitmodules`。
+
+DryRun 不会：
+
+- checkout 分支。
+- 修改 HEAD。
+- 修改工作树。
+- 执行 pull 或 merge。
+
+允许 fetch 是为了确保 DryRun 解析出的子模块分支与真实执行一致。
+
+## 11. 状态、日志与退出码
+
+终端状态标记：
+
+| 标记 | 含义 |
+|---|---|
+| `[+]` | 操作成功 |
+| `[~]` | DryRun 计划 |
+| `[-]` | 正常跳过或排除 |
+| `[D]` | 因父仓库或前置操作失败而跳过 |
+| `[X]` | 操作失败 |
+| `[!]` | 系统警告 |
+
+汇总报告包括：
+
+- 成功操作数。
+- DryRun 计划数。
+- 失败数。
+- 正常跳过数。
+- 依赖跳过数。
+- 子模块分支来源统计。
+- 失败仓库及操作阶段。
+
+退出码：
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 没有失败或依赖失败；允许存在正常跳过项 |
+| `1` | 至少一个 Git 操作失败、存在依赖失败，或 PowerShell 参数绑定/运行时错误 |
+| `2` | 脚本预检发现 Git 不可用、主目录不存在或没有发现仓库 |
+
+## 12. 常用示例
+
+处理主仓库、子模块和独立嵌套仓库：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -Branch developbim `
+    -NoPause
+```
+
+只处理主仓库及子模块：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -Branch developbim `
+    -SubmodulesOnly `
+    -NoPause
+```
+
+并行执行：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -Parallel `
+    -ThrottleLimit 8 `
+    -NoPause
+```
+
+检查执行计划：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -DryRun `
+    -NoPause
+```
+
+仅拉取已经位于正确分支的仓库：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -Mode PullOnly `
+    -NoPause
+```
+
+## 13. 建议的执行流程
+
+首次在真实仓库树中使用时，建议先执行：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 -DryRun -SubmodulesOnly -NoPause
+```
+
+确认以下信息后再执行真实操作：
+
+- 主仓库目标分支正确。
+- 子模块名称、路径和分支来源正确。
+- 没有意外纳入的独立仓库。
+- 没有当前分支不匹配或远端缺失错误。
+
+然后移除 `-DryRun`：
+
+```powershell
+.\git_recursive_checkout_pull.ps1 -SubmodulesOnly -NoPause
+```
+
+## 14. 开发检查
+
+仓库提供了 `PSScriptAnalyzerSettings.psd1`，其中仅排除两项有意设计：
+
+- 终端状态界面需要彩色 `Write-Host`。
+- 脚本只支持 PowerShell 7，因此使用 UTF-8 无 BOM。
+
+运行静态检查：
+
+```powershell
+Invoke-ScriptAnalyzer `
+    -Path . `
+    -Recurse `
+    -Settings .\PSScriptAnalyzerSettings.psd1
+```
+
+运行集成测试：
+
+```powershell
+Invoke-Pester .\tests\git_recursive_checkout_pull.Tests.ps1
 ```

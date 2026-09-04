@@ -1,54 +1,69 @@
+<#
+.SYNOPSIS
+安全地批量切换并拉取主仓库、已初始化子模块和可选的独立嵌套仓库。
+
+.DESCRIPTION
+主仓库和独立仓库使用 Branch 参数；子模块根据直接父仓库目标版本中的
+.gitmodules branch 配置选择分支，branch = . 时继承父仓库目标分支。
+脚本按父仓库到子模块的顺序执行，checkout 未成功时禁止继续 pull。
+
+脚本不会克隆仓库、初始化子模块、按 gitlink commit 检出、自动 stash/reset，
+也不会自动解决冲突。DryRun 会 fetch 远端引用以准确解析目标 .gitmodules，
+但不会 checkout、pull 或修改工作树。
+#>
+#Requires -Version 7.0
+
 param(
     [string]$MainDir = (Join-Path (Get-Location) "main"),
     [string]$Branch = "developbim",
     [string]$Remote = "origin",
     [ValidateSet("All", "CheckoutOnly", "PullOnly")]
     [string]$Mode = "All",
-    [int]$RetryCount = 2,
-    [int]$RetryDelaySeconds = 2,
+    [ValidateRange(0, 2147483647)][int]$RetryCount = 2,
+    [ValidateRange(0, 2147483647)][int]$RetryDelaySeconds = 2,
     [switch]$Parallel,
-    [int]$ThrottleLimit = 6,
+    [ValidateRange(1, 2147483647)][int]$ThrottleLimit = 6,
     [switch]$DryRun,
     [string]$LogDir = (Join-Path $PSScriptRoot "logs"),
     [string[]]$ExcludePatterns = @(),
-    [int]$MaxDepth = 5,
+    [ValidateRange(0, 2147483647)][int]$MaxDepth = 5,
+    [switch]$SubmodulesOnly,
     [switch]$NoPause
 )
 
 $ErrorActionPreference = "Stop"
+$defaultExcludePatterns = @("BIM\ZwBm", "BIM\BmDb")
+$script:AdditionalExcludePatterns = $ExcludePatterns
 
-$defaultExcludePatterns = @(
-    "BIM\ZwBm",
-    "BIM\BmDb"
-)
-
-if (-not (Test-Path -Path $MainDir -PathType Container)) {
-    throw "主目录不存在: $MainDir"
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Error "未找到 git 命令，请先安装 Git 并加入 PATH。" -ErrorAction Continue
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $MainDir -PathType Container)) {
+    Write-Error "主目录不存在: $MainDir" -ErrorAction Continue
+    exit 2
 }
 
-if (-not (Test-Path -Path $LogDir -PathType Container)) {
+$MainDir = [System.IO.Path]::GetFullPath($MainDir).TrimEnd('\', '/')
+if (-not (Test-Path -LiteralPath $LogDir -PathType Container)) {
     New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
 }
-
 $timeTag = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = Join-Path $LogDir "git_checkout_pull_$timeTag.log"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 美化输出工具
-# ─────────────────────────────────────────────────────────────────────────────
-
 $script:TotalWidth = 72
-$script:Stats = @{ Success = 0; Failed = 0; Skipped = 0 }
+$script:Stats = @{ Success = 0; Failed = 0; Skipped = 0; DependencyFailed = 0; Planned = 0 }
 $script:FailedRepos = [System.Collections.Generic.List[object]]::new()
+$script:RepoIndex = @{}
+$script:BranchStats = @{ Gitmodules = 0; Inherited = 0; Fallback = 0; Parameter = 0 }
 
-function Write-Log {
+function Write-GitBatchLog {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet("INFO", "WARN", "ERROR", "OK")]
-        [string]$Level = "INFO"
+        [ValidateSet("INFO", "WARN", "ERROR", "OK")][string]$Level = "INFO"
     )
     $line = "[{0}] [{1,-5}] {2}" -f (Get-Date -Format "HH:mm:ss"), $Level, $Message
-    Add-Content -Path $script:logFile -Value $line -ErrorAction SilentlyContinue
+    Add-Content -LiteralPath $script:logFile -Value $line -ErrorAction SilentlyContinue
 }
 
 function Write-Banner {
@@ -57,13 +72,10 @@ function Write-Banner {
     $pad = [Math]::Max(0, $innerWidth - $Text.Length - 2)
     $left = [Math]::Floor($pad / 2)
     $right = $pad - $left
-    $top = "╔$('═' * $innerWidth)╗"
-    $mid = "║$(' ' * $left) $Text $(' ' * $right)║"
-    $bot = "╚$('═' * $innerWidth)╝"
     Write-Host ""
-    Write-Host $top -ForegroundColor Cyan
-    Write-Host $mid -ForegroundColor Cyan
-    Write-Host $bot -ForegroundColor Cyan
+    Write-Host "╔$('═' * $innerWidth)╗" -ForegroundColor Cyan
+    Write-Host "║$(' ' * $left) $Text $(' ' * $right)║" -ForegroundColor Cyan
+    Write-Host "╚$('═' * $innerWidth)╝" -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -78,30 +90,24 @@ function Write-Status {
     param(
         [string]$RepoName,
         [string]$Message,
-        [ValidateSet("OK", "FAIL", "SKIP", "INFO", "WARN")]
-        [string]$Level = "INFO"
+        [ValidateSet("OK", "FAIL", "SKIP", "DEPENDENCY", "PLAN", "INFO", "WARN")][string]$Level = "INFO"
     )
     $icon = switch ($Level) {
-        "OK"   { "[+]" }
-        "FAIL" { "[X]" }
-        "SKIP" { "[-]" }
-        "WARN" { "[!]" }
-        default { "[*]" }
+        "OK" { "[+]" }; "FAIL" { "[X]" }; "SKIP" { "[-]" }; "DEPENDENCY" { "[D]" }
+        "PLAN" { "[~]" }; "WARN" { "[!]" }; default { "[*]" }
     }
     $color = switch ($Level) {
-        "OK"   { "Green" }
-        "FAIL" { "Red" }
-        "SKIP" { "DarkYellow" }
-        "WARN" { "Yellow" }
-        default { "White" }
+        "OK" { "Green" }; "FAIL" { "Red" }; "SKIP" { "DarkYellow" }; "DEPENDENCY" { "DarkYellow" }
+        "PLAN" { "Magenta" }; "WARN" { "Yellow" }; default { "White" }
     }
     $nameDisplay = if ($RepoName.Length -gt 28) { $RepoName.Substring(0, 25) + "..." } else { $RepoName }
-    $prefix = "$icon $($nameDisplay.PadRight(28))"
-    Write-Host $prefix -ForegroundColor $color -NoNewline
+    Write-Host "$icon $($nameDisplay.PadRight(28))" -ForegroundColor $color -NoNewline
     Write-Host " $Message" -ForegroundColor Gray
-
-    $logLevel = switch ($Level) { "OK" { "OK" } "FAIL" { "ERROR" } "SKIP" { "WARN" } "WARN" { "WARN" } default { "INFO" } }
-    Write-Log -Message "$RepoName | $Message" -Level $logLevel
+    $logLevel = switch ($Level) {
+        "OK" { "OK" }; "FAIL" { "ERROR" }; "SKIP" { "WARN" }; "DEPENDENCY" { "WARN" }
+        "WARN" { "WARN" }; default { "INFO" }
+    }
+    Write-GitBatchLog -Message "$RepoName | $Message" -Level $logLevel
 }
 
 function Write-Detail {
@@ -109,61 +115,66 @@ function Write-Detail {
     Write-Host "    $Message" -ForegroundColor DarkGray
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 核心功能
-# ─────────────────────────────────────────────────────────────────────────────
+function Get-NormalizedPath {
+    param([Parameter(Mandatory)][string]$Path)
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+}
 
-function Find-GitRepos {
-    param(
-        [string]$Path,
-        [int]$CurrentDepth = 0
-    )
-
-    if ($CurrentDepth -gt $MaxDepth) { return }
-
-    $gitDir = Join-Path $Path ".git"
-    $isGitRepo = Test-Path $gitDir
-
-    if ($isGitRepo) {
-        [PSCustomObject]@{
-            Path         = $Path
-            Name         = Split-Path $Path -Leaf
-            RelativePath = Get-RelativePath -BasePath $MainDir -TargetPath $Path
-        }
-    }
-
-    $children = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
-    foreach ($child in $children) {
-        if ($child.Name -in @("node_modules", ".git", "__pycache__", ".vs", ".idea")) { continue }
-        Find-GitRepos -Path $child.FullName -CurrentDepth ($CurrentDepth + 1)
-    }
+function Get-PathKey {
+    param([Parameter(Mandatory)][string]$Path)
+    return (Get-NormalizedPath -Path $Path).ToLowerInvariant()
 }
 
 function Get-RelativePath {
     param([string]$BasePath, [string]$TargetPath)
-    $base = [System.IO.Path]::GetFullPath($BasePath).TrimEnd('\', '/')
-    $target = [System.IO.Path]::GetFullPath($TargetPath).TrimEnd('\', '/')
-    if ($target.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $rel = $target.Substring($base.Length).TrimStart('\', '/')
-        if (-not $rel) { return "." }
-        return $rel
+    $base = Get-NormalizedPath -Path $BasePath
+    $target = Get-NormalizedPath -Path $TargetPath
+    if ($target -ieq $base) { return "." }
+    $prefix = $base + [System.IO.Path]::DirectorySeparatorChar
+    if ($target.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $target.Substring($prefix.Length)
     }
     return $target
 }
 
+function Find-GitRepo {
+    param([string]$Path, [int]$CurrentDepth = 0)
+    if ($CurrentDepth -gt $MaxDepth) { return }
+
+    if (Test-Path -LiteralPath (Join-Path $Path ".git")) {
+        $relativePath = Get-RelativePath -BasePath $MainDir -TargetPath $Path
+        [PSCustomObject]@{
+            Path = Get-NormalizedPath -Path $Path
+            Name = Split-Path $Path -Leaf
+            RelativePath = $relativePath
+            Type = "Standalone"
+            ParentPath = $null
+            SubmoduleName = $null
+            Depth = if ($relativePath -eq ".") { 0 } else { ($relativePath -split '[\\/]').Count }
+            TargetBranch = $null
+            BranchSource = $null
+            MetadataRef = $null
+            CheckoutStatus = $null
+            PullStatus = $null
+            ReadyForChildren = $false
+            Excluded = $false
+        }
+    }
+
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue)) {
+        if ($child.Name -in @("node_modules", ".git", "__pycache__", ".vs", ".idea")) { continue }
+        Find-GitRepo -Path $child.FullName -CurrentDepth ($CurrentDepth + 1)
+    }
+}
+
 function Test-ShouldExclude {
     param([string]$RelativePath)
-
-    # 顶层仓库（MainDir 本身）的相对路径为 "."，不是目录名，任何目录名规则都匹配不到它；
-    # 这里额外用 MainDir 的目录名参与匹配，方便直接用目录名排除顶层仓库
     $matchTargets = @($RelativePath)
     if ($RelativePath -eq ".") {
         $topLeaf = Split-Path $MainDir -Leaf
         if ($topLeaf -and $matchTargets -notcontains $topLeaf) { $matchTargets += $topLeaf }
     }
-
-    $allPatterns = $defaultExcludePatterns + $ExcludePatterns
-    foreach ($pattern in $allPatterns) {
+    foreach ($pattern in @($defaultExcludePatterns + $script:AdditionalExcludePatterns)) {
         if (-not $pattern) { continue }
         $normalized = $pattern.Trim().Replace('/', '\')
         foreach ($target in $matchTargets) {
@@ -173,356 +184,469 @@ function Test-ShouldExclude {
     return $false
 }
 
-function Invoke-GitOperation {
-    param(
-        [string]$RepoPath,
-        [string]$RepoName,
-        [ValidateSet("checkout", "pull")]
-        [string]$Operation
-    )
-
-    if ($DryRun) {
-        if ($Operation -eq "checkout") {
-            Write-Status -RepoName $RepoName -Message "DRY RUN: git fetch $Remote; git checkout $Branch (本地无此分支时自动 -b --track $Remote/$Branch)" -Level "INFO"
-        } else {
-            Write-Status -RepoName $RepoName -Message "DRY RUN: git pull --no-rebase $Remote $Branch" -Level "INFO"
-        }
-        return $true
-    }
-
-    if ($Operation -eq "checkout") {
-        # 先 fetch 保证远程引用最新；本地无此分支则从远程建立跟踪分支，否则直接切换
-        Push-Location $RepoPath
-        try {
-            $fetchOut = & git fetch $Remote --quiet 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log -Message "$RepoName | fetch $Remote 失败（继续尝试 checkout）: $(($fetchOut | Out-String).Trim())" -Level "WARN"
-            }
-            & git show-ref --verify --quiet "refs/heads/$Branch"
-            $localExists = ($LASTEXITCODE -eq 0)
-        } finally {
-            Pop-Location
-        }
-        $gitArgs = if ($localExists) {
-            @("checkout", $Branch)
-        } else {
-            @("checkout", "-b", $Branch, "--track", "$Remote/$Branch")
-        }
-    } else {
-        $gitArgs = @("pull", "--no-rebase", $Remote, $Branch)
-    }
-
-    $maxAttempts = $RetryCount + 1
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        try {
-            Push-Location $RepoPath
-            $output = & git @gitArgs 2>&1
-            $code = $LASTEXITCODE
-        } finally {
-            Pop-Location
-        }
-
-        if ($code -eq 0) {
-            $brief = ($output | Out-String).Trim().Split("`n")[0]
-            if ($brief.Length -gt 50) { $brief = $brief.Substring(0, 50) + "..." }
-            Write-Status -RepoName $RepoName -Message "$Operation OK$(if($brief){" | $brief"})" -Level "OK"
-            return $true
-        }
-
-        if ($attempt -lt $maxAttempts) {
-            Write-Status -RepoName $RepoName -Message "$Operation 失败 (第 $attempt 次)，${RetryDelaySeconds}s 后重试..." -Level "WARN"
-            Start-Sleep -Seconds $RetryDelaySeconds
-        }
-    }
-
-    $errMsg = ($output | Out-String).Trim().Split("`n") | Select-Object -First 2
-    Write-Status -RepoName $RepoName -Message "$Operation 失败 (exit=$code, 共尝试 $maxAttempts 次)" -Level "FAIL"
-    foreach ($line in $errMsg) {
-        Write-Detail $line
-    }
-    return $false
+function Get-RepoPlan {
+    param([string]$Path)
+    $key = Get-PathKey -Path $Path
+    if ($script:RepoIndex.ContainsKey($key)) { return $script:RepoIndex[$key] }
+    return $null
 }
 
-function Invoke-GitOperationParallel {
-    param(
-        [object[]]$Repos,
-        [ValidateSet("checkout", "pull")]
-        [string]$Operation
-    )
+function Initialize-RepoPlan {
+    param([object[]]$Repos)
+    foreach ($repo in $Repos) {
+        $script:RepoIndex[(Get-PathKey -Path $repo.Path)] = $repo
+    }
+    foreach ($repo in $Repos) {
+        if ($repo.Path -ieq $MainDir) {
+            $repo.Type = "Main"
+            $repo.Depth = 0
+            continue
+        }
+        $superOutput = & git -C $repo.Path rev-parse --show-superproject-working-tree 2>$null
+        $superCode = $LASTEXITCODE
+        $super = $superOutput | Select-Object -First 1
+        if ($superCode -eq 0 -and $super) {
+            $superPath = Get-NormalizedPath -Path "$($super.Trim())"
+            $rootPrefix = $MainDir + [System.IO.Path]::DirectorySeparatorChar
+            if ($superPath -ieq $MainDir -or $superPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $repo.Type = "Submodule"
+                $repo.ParentPath = $superPath
+            }
+        }
+    }
+}
 
-    if (-not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
-        Write-Status -RepoName "SYSTEM" -Message "Start-ThreadJob 不可用，回退到顺序模式" -Level "WARN"
-        return (Invoke-GitOperationSequential -Repos $Repos -Operation $Operation)
+function Get-GitmodulesConfigArgument {
+    param([object]$ParentRepo)
+    $gitConfigArguments = @("-C", $ParentRepo.Path, "config")
+    if ($DryRun) {
+        if (-not $ParentRepo.MetadataRef) { return $null }
+        return @($gitConfigArguments + @("--blob", "$($ParentRepo.MetadataRef):.gitmodules"))
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $ParentRepo.Path ".gitmodules") -PathType Leaf)) {
+        return $null
+    }
+    return @($gitConfigArguments + @("--file", ".gitmodules"))
+}
+
+function Get-TargetBranch {
+    param([object]$Repo)
+    if ($Repo.Type -ne "Submodule") {
+        return [PSCustomObject]@{ Valid = $true; Registered = $false; Branch = $Branch; Source = "Parameter"; SubmoduleName = $null; Message = $null }
+    }
+
+    $parent = Get-RepoPlan -Path $Repo.ParentPath
+    if ($null -eq $parent) {
+        return [PSCustomObject]@{ Valid = $false; Registered = $false; Branch = $null; Source = $null; SubmoduleName = $null; Message = "未发现直接父仓库: $($Repo.ParentPath)" }
+    }
+    $baseArgs = Get-GitmodulesConfigArgument -ParentRepo $parent
+    if ($null -eq $baseArgs) {
+        return [PSCustomObject]@{ Valid = $true; Registered = $false; Branch = $Branch; Source = "Fallback"; SubmoduleName = $null; Message = "父仓库目标版本不存在 .gitmodules" }
+    }
+
+    $keys = & git @baseArgs --name-only --get-regexp '^submodule\..*\.path$' 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return [PSCustomObject]@{ Valid = $true; Registered = $false; Branch = $Branch; Source = "Fallback"; SubmoduleName = $null; Message = "未找到子模块路径配置" }
+    }
+
+    $childRelative = (Get-RelativePath -BasePath $parent.Path -TargetPath $Repo.Path).Replace('\', '/').TrimEnd('/')
+    foreach ($pathKeyValue in @($keys)) {
+        $pathKey = "$pathKeyValue".Trim()
+        if (-not $pathKey.StartsWith("submodule.", [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not $pathKey.EndsWith(".path", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        $declaredPathOutput = & git @baseArgs --get $pathKey 2>$null
+        if ($LASTEXITCODE -ne 0) { continue }
+        $declaredPath = "$($declaredPathOutput | Select-Object -First 1)".Trim().Replace('\', '/').TrimEnd('/')
+        if ($declaredPath -ine $childRelative) { continue }
+
+        $submoduleName = $pathKey.Substring(10, $pathKey.Length - 15)
+        $declaredBranchOutput = & git @baseArgs --get "submodule.$submoduleName.branch" 2>$null
+        $branchCode = $LASTEXITCODE
+        $declaredBranch = "$($declaredBranchOutput | Select-Object -First 1)".Trim()
+        if ($branchCode -eq 0 -and $declaredBranch) {
+            if ($declaredBranch -eq ".") {
+                return [PSCustomObject]@{ Valid = $true; Registered = $true; Branch = $parent.TargetBranch; Source = "Inherited"; SubmoduleName = $submoduleName; Message = $null }
+            }
+            return [PSCustomObject]@{ Valid = $true; Registered = $true; Branch = $declaredBranch; Source = "Gitmodules"; SubmoduleName = $submoduleName; Message = $null }
+        }
+        return [PSCustomObject]@{ Valid = $true; Registered = $true; Branch = $Branch; Source = "Fallback"; SubmoduleName = $submoduleName; Message = $null }
+    }
+
+    return [PSCustomObject]@{ Valid = $true; Registered = $false; Branch = $Branch; Source = "Fallback"; SubmoduleName = $null; Message = "父仓库目标版本未登记此子模块" }
+}
+
+# 顺序和并行模式共用同一工作单元。
+$script:OperationWorker = {
+    param($RepoPath, $RepoName, $Operation, $TargetBranch, $RemoteName, $MaxRetry, $RetryDelay, $UseDryRun, $AssumeTargetCheckedOut)
+    $ErrorActionPreference = "Continue"
+    $workerRepoName = $RepoName
+    $workerMaxRetry = $MaxRetry
+    $workerRetryDelay = $RetryDelay
+
+    function ConvertTo-WorkerResult {
+        param($Status, $Message, $ExitCode = 0, $RemoteExists = $null, $LocalExists = $null, $MetadataRef = $null)
+        [PSCustomObject]@{
+            RepoPath = $RepoPath; RepoName = $workerRepoName; Operation = $Operation; TargetBranch = $TargetBranch
+            Status = $Status; ExitCode = $ExitCode; Message = $Message
+            RemoteExists = $RemoteExists; LocalExists = $LocalExists; MetadataRef = $MetadataRef
+        }
+    }
+
+    function Sync-RemoteBranch {
+        $remoteUrl = & git remote get-url $RemoteName 2>&1
+        $remoteCode = $LASTEXITCODE
+        if ($remoteCode -ne 0) {
+            return [PSCustomObject]@{ Status = "FAIL"; ExitCode = $remoteCode; Message = "远程 $RemoteName 不存在: $(($remoteUrl | Out-String).Trim())" }
+        }
+
+        $maxAttempts = $workerMaxRetry + 1
+        $lastCode = 1
+        $errorText = ""
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            $remoteOutput = & git ls-remote --exit-code --heads $RemoteName "refs/heads/$TargetBranch" 2>&1
+            $lastCode = $LASTEXITCODE
+            if ($lastCode -eq 2) {
+                return [PSCustomObject]@{ Status = "MISSING"; ExitCode = 0; Message = "远端 $RemoteName 无分支 $TargetBranch" }
+            }
+            if ($lastCode -eq 0) {
+                $refspec = "+refs/heads/$TargetBranch`:refs/remotes/$RemoteName/$TargetBranch"
+                $fetchOutput = & git fetch --quiet $RemoteName $refspec 2>&1
+                $lastCode = $LASTEXITCODE
+                if ($lastCode -eq 0) {
+                    return [PSCustomObject]@{ Status = "OK"; ExitCode = 0; Message = ""; MetadataRef = "refs/remotes/$RemoteName/$TargetBranch" }
+                }
+                $errorText = ($fetchOutput | Out-String).Trim()
+            } else {
+                $errorText = ($remoteOutput | Out-String).Trim()
+            }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds $workerRetryDelay }
+        }
+        return [PSCustomObject]@{ Status = "FAIL"; ExitCode = $lastCode; Message = "远端检查或 fetch 失败（共尝试 $maxAttempts 次）: $errorText" }
+    }
+
+    Push-Location $RepoPath
+    try {
+        $branchCheck = & git check-ref-format --branch $TargetBranch 2>&1
+        $branchCode = $LASTEXITCODE
+        if ($branchCode -ne 0) {
+            return ConvertTo-WorkerResult -Status "FAIL" -ExitCode $branchCode -Message "非法目标分支名 $TargetBranch：$(($branchCheck | Out-String).Trim())"
+        }
+
+        & git show-ref --verify --quiet "refs/heads/$TargetBranch" 2>$null
+        $localExists = ($LASTEXITCODE -eq 0)
+
+        if ($Operation -eq "pull" -and -not ($UseDryRun -and $AssumeTargetCheckedOut)) {
+            $currentOutput = & git symbolic-ref --quiet --short HEAD 2>&1
+            $currentCode = $LASTEXITCODE
+            $currentBranch = "$($currentOutput | Select-Object -First 1)".Trim()
+            if ($currentCode -ne 0 -or $currentBranch -ine $TargetBranch) {
+                $displayCurrent = if ($currentBranch) { $currentBranch } else { "DETACHED HEAD" }
+                return ConvertTo-WorkerResult -Status "FAIL" -ExitCode 1 -LocalExists $localExists -Message "拒绝 pull：当前分支为 $displayCurrent，目标分支为 $TargetBranch"
+            }
+        }
+
+        $sync = Sync-RemoteBranch
+        if ($sync.Status -eq "FAIL") {
+            return ConvertTo-WorkerResult -Status "FAIL" -ExitCode $sync.ExitCode -LocalExists $localExists -Message $sync.Message
+        }
+
+        $remoteExists = ($sync.Status -eq "OK")
+        $metadataRef = if ($remoteExists) { $sync.MetadataRef } elseif ($localExists) { "refs/heads/$TargetBranch" } else { $null }
+
+        if ($Operation -eq "checkout") {
+            if (-not $remoteExists -and -not $localExists) {
+                return ConvertTo-WorkerResult -Status "SKIP" -RemoteExists $false -LocalExists $false -Message "远端和本地均无分支 $TargetBranch，跳过 checkout"
+            }
+            $description = if ($localExists) { "git checkout $TargetBranch" } else { "git checkout -b $TargetBranch --track $RemoteName/$TargetBranch" }
+            if ($UseDryRun) {
+                $suffix = if ($remoteExists) { "" } else { "；远端分支不存在，仅切换本地分支" }
+                return ConvertTo-WorkerResult -Status "DRYRUN" -RemoteExists $remoteExists -LocalExists $localExists -MetadataRef $metadataRef -Message "计划: $description$suffix"
+            }
+
+            $checkoutArgs = if ($localExists) { @("checkout", $TargetBranch) } else { @("checkout", "-b", $TargetBranch, "--track", "$RemoteName/$TargetBranch") }
+            $checkoutOutput = & git @checkoutArgs 2>&1
+            $checkoutCode = $LASTEXITCODE
+            if ($checkoutCode -ne 0) {
+                return ConvertTo-WorkerResult -Status "FAIL" -ExitCode $checkoutCode -RemoteExists $remoteExists -LocalExists $localExists -Message "checkout 失败: $(($checkoutOutput | Out-String).Trim())"
+            }
+            return ConvertTo-WorkerResult -Status "OK" -RemoteExists $remoteExists -LocalExists $true -MetadataRef $metadataRef -Message "checkout OK -> $TargetBranch"
+        }
+
+        if (-not $remoteExists) {
+            return ConvertTo-WorkerResult -Status "SKIP" -RemoteExists $false -LocalExists $localExists -MetadataRef $metadataRef -Message "远端 $RemoteName 无分支 $TargetBranch，跳过 pull"
+        }
+        if ($UseDryRun) {
+            return ConvertTo-WorkerResult -Status "DRYRUN" -RemoteExists $true -LocalExists $localExists -MetadataRef $metadataRef -Message "计划: git pull --no-rebase $RemoteName $TargetBranch"
+        }
+
+        $pullOutput = & git pull --no-rebase $RemoteName $TargetBranch 2>&1
+        $pullCode = $LASTEXITCODE
+        if ($pullCode -ne 0) {
+            return ConvertTo-WorkerResult -Status "FAIL" -ExitCode $pullCode -RemoteExists $true -LocalExists $localExists -MetadataRef $metadataRef -Message "pull 失败: $(($pullOutput | Out-String).Trim())"
+        }
+        $brief = ($pullOutput | Out-String).Trim().Split("`n")[0]
+        return ConvertTo-WorkerResult -Status "OK" -RemoteExists $true -LocalExists $localExists -MetadataRef $metadataRef -Message "pull OK$(if ($brief) { " | $brief" })"
+    } finally {
+        Pop-Location
+    }
+}
+
+function ConvertTo-LocalResult {
+    param([object]$Repo, [string]$Operation, [string]$Status, [string]$Message)
+    [PSCustomObject]@{
+        RepoPath = $Repo.Path; RepoName = $Repo.Name; Operation = $Operation; TargetBranch = $Repo.TargetBranch
+        Status = $Status; ExitCode = 0; Message = $Message
+        RemoteExists = $null; LocalExists = $null; MetadataRef = $null
+    }
+}
+
+function Register-OperationResult {
+    param([object]$Repo, [object]$Result)
+    if ($Result.Operation -eq "checkout") { $Repo.CheckoutStatus = $Result.Status }
+    if ($Result.Operation -eq "pull") { $Repo.PullStatus = $Result.Status }
+    if ($Result.MetadataRef) { $Repo.MetadataRef = $Result.MetadataRef }
+
+    switch ($Result.Status) {
+        "OK" { $script:Stats.Success++; Write-Status -RepoName $Repo.Name -Message $Result.Message -Level "OK" }
+        "DRYRUN" { $script:Stats.Planned++; Write-Status -RepoName $Repo.Name -Message $Result.Message -Level "PLAN" }
+        "SKIP" { $script:Stats.Skipped++; Write-Status -RepoName $Repo.Name -Message $Result.Message -Level "SKIP" }
+        "DEPENDENCY" { $script:Stats.DependencyFailed++; Write-Status -RepoName $Repo.Name -Message $Result.Message -Level "DEPENDENCY" }
+        default {
+            $script:Stats.Failed++
+            Write-Status -RepoName $Repo.Name -Message $Result.Message -Level "FAIL"
+            $script:FailedRepos.Add([PSCustomObject]@{ Name = $Repo.Name; Path = $Repo.RelativePath; Step = $Result.Operation; Message = $Result.Message })
+        }
+    }
+}
+
+function Invoke-RepositoryBatch {
+    param([object[]]$Repos, [ValidateSet("checkout", "pull")][string]$Operation, [switch]$AssumeTargetCheckedOut)
+    if ($Repos.Count -eq 0) { return @() }
+
+    $threadJobAvailable = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+    $useParallel = $Parallel -and $Repos.Count -gt 1 -and $threadJobAvailable
+    if ($Parallel -and -not $threadJobAvailable -and $Repos.Count -gt 1) {
+        Write-Status -RepoName "SYSTEM" -Message "Start-ThreadJob 不可用，回退到顺序执行" -Level "WARN"
     }
 
     $results = [System.Collections.Generic.List[object]]::new()
-    $batchSize = [Math]::Max(1, $ThrottleLimit)
+    if (-not $useParallel) {
+        foreach ($repo in $Repos) {
+            $result = & $script:OperationWorker $repo.Path $repo.Name $Operation $repo.TargetBranch $Remote $RetryCount $RetryDelaySeconds $DryRun.IsPresent $AssumeTargetCheckedOut.IsPresent
+            $results.Add($result)
+        }
+        return $results.ToArray()
+    }
 
+    $batchSize = [Math]::Max(1, $ThrottleLimit)
     for ($i = 0; $i -lt $Repos.Count; $i += $batchSize) {
         $end = [Math]::Min($i + $batchSize - 1, $Repos.Count - 1)
-        $batch = $Repos[$i..$end]
-
-        $jobs = foreach ($repo in $batch) {
-            Start-ThreadJob -Name "$Operation::$($repo.Name)" -ScriptBlock {
-                param($RepoPath, $RepoName, $Op, $BranchName, $RemoteName, $MaxRetry, $RetryDelay, $UseDryRun)
-
-                if ($UseDryRun) {
-                    return [PSCustomObject]@{
-                        RepoName = $RepoName; RepoPath = $RepoPath
-                        Operation = $Op; Success = $true; ExitCode = 0
-                        Attempts = 0; Output = "DRY RUN"
-                    }
-                }
-
-                $fetchWarn = $null
-                if ($Op -eq "checkout") {
-                    # 先 fetch 保证远程引用最新；本地无此分支则从远程建立跟踪分支，否则直接切换
-                    Push-Location $RepoPath
-                    try {
-                        $fetchOut = & git fetch $RemoteName --quiet 2>&1
-                        if ($LASTEXITCODE -ne 0) {
-                            $fetchWarn = "fetch $RemoteName 失败（继续尝试 checkout）: $(($fetchOut | Out-String).Trim())"
-                        }
-                        & git show-ref --verify --quiet "refs/heads/$BranchName"
-                        $localExists = ($LASTEXITCODE -eq 0)
-                    } finally {
-                        Pop-Location
-                    }
-                    $gitArgs = if ($localExists) {
-                        @("checkout", $BranchName)
-                    } else {
-                        @("checkout", "-b", $BranchName, "--track", "$RemoteName/$BranchName")
-                    }
-                } else {
-                    $gitArgs = @("pull", "--no-rebase", $RemoteName, $BranchName)
-                }
-
-                $maxAttempts = $MaxRetry + 1
-                for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-                    try {
-                        Push-Location $RepoPath
-                        $output = & git @gitArgs 2>&1
-                        $code = $LASTEXITCODE
-                    } finally {
-                        Pop-Location
-                    }
-
-                    if ($code -eq 0) {
-                        return [PSCustomObject]@{
-                            RepoName = $RepoName; RepoPath = $RepoPath
-                            Operation = $Op; Success = $true; ExitCode = 0
-                            Attempts = $attempt; Output = ($output | Out-String).Trim()
-                            FetchWarning = $fetchWarn
-                        }
-                    }
-
-                    if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds $RetryDelay }
-                }
-
-                return [PSCustomObject]@{
-                    RepoName = $RepoName; RepoPath = $RepoPath
-                    Operation = $Op; Success = $false; ExitCode = $code
-                    Attempts = $maxAttempts; Output = ($output | Out-String).Trim()
-                    FetchWarning = $fetchWarn
-                }
-            } -ArgumentList $repo.Path, $repo.Name, $Operation, $Branch, $Remote, $RetryCount, $RetryDelaySeconds, $DryRun.IsPresent
+        $batch = @($Repos[$i..$end])
+        $jobEntries = [System.Collections.Generic.List[object]]::new()
+        foreach ($repo in $batch) {
+            $job = Start-ThreadJob -Name "$Operation::$($repo.Name)" -ScriptBlock $script:OperationWorker -ArgumentList $repo.Path, $repo.Name, $Operation, $repo.TargetBranch, $Remote, $RetryCount, $RetryDelaySeconds, $DryRun.IsPresent, $AssumeTargetCheckedOut.IsPresent
+            $jobEntries.Add([PSCustomObject]@{ Job = $job; Repo = $repo })
         }
 
-        Wait-Job -Job $jobs | Out-Null
-        $batchResults = Receive-Job -Job $jobs
-        Remove-Job -Job $jobs -Force | Out-Null
-
-        foreach ($r in $batchResults) {
-            if ($r.FetchWarning) {
-                Write-Log -Message "$($r.RepoName) | $($r.FetchWarning)" -Level "WARN"
+        Wait-Job -Job @($jobEntries | ForEach-Object { $_.Job }) | Out-Null
+        foreach ($entry in $jobEntries) {
+            $received = @(Receive-Job -Job $entry.Job -ErrorAction SilentlyContinue)
+            Remove-Job -Job $entry.Job -Force | Out-Null
+            $result = $received | Where-Object { $_.PSObject.Properties["Status"] } | Select-Object -Last 1
+            if ($null -eq $result) {
+                $result = ConvertTo-LocalResult -Repo $entry.Repo -Operation $Operation -Status "FAIL" -Message "并行任务未返回有效结果"
             }
-            if ($r.Success) {
-                $brief = $r.Output.Split("`n")[0]
-                if ($brief.Length -gt 50) { $brief = $brief.Substring(0, 50) + "..." }
-                Write-Status -RepoName $r.RepoName -Message "$($r.Operation) OK$(if($brief -and $brief -ne 'DRY RUN'){" | $brief"})" -Level "OK"
-                $script:Stats.Success++
-            } else {
-                Write-Status -RepoName $r.RepoName -Message "$($r.Operation) 失败 (exit=$($r.ExitCode))" -Level "FAIL"
-                if ($r.Output) {
-                    $r.Output.Split("`n") | Select-Object -First 2 | ForEach-Object { Write-Detail $_ }
-                }
-                $script:Stats.Failed++
-                $script:FailedRepos.Add([PSCustomObject]@{ Name = $r.RepoName; Path = $r.RepoPath; Step = $r.Operation })
-            }
-            $results.Add($r)
+            $results.Add($result)
         }
     }
-
-    return $results
+    return $results.ToArray()
 }
 
-function Invoke-GitOperationSequential {
-    param(
-        [object[]]$Repos,
-        [ValidateSet("checkout", "pull")]
-        [string]$Operation
-    )
+function Invoke-AndRegisterBatch {
+    param([object[]]$Repos, [ValidateSet("checkout", "pull")][string]$Operation, [switch]$AssumeTargetCheckedOut)
+    $results = @(Invoke-RepositoryBatch -Repos $Repos -Operation $Operation -AssumeTargetCheckedOut:$AssumeTargetCheckedOut)
+    foreach ($result in $results) {
+        $repo = Get-RepoPlan -Path $result.RepoPath
+        if ($null -ne $repo) { Register-OperationResult -Repo $repo -Result $result }
+    }
+}
 
-    $counter = 0
-    $total = $Repos.Count
+function Test-CheckoutSucceeded {
+    param([object]$Repo)
+    return $Repo.CheckoutStatus -in @("OK", "DRYRUN")
+}
+
+function Test-PullAllowsChild {
+    param([object]$Repo)
+    return $Repo.PullStatus -in @("OK", "DRYRUN", "SKIP")
+}
+
+function Get-RepoChildReadiness {
+    param([object]$Repo)
+    switch ($Mode) {
+        "CheckoutOnly" { Test-CheckoutSucceeded -Repo $Repo }
+        "PullOnly" { $Repo.PullStatus -in @("OK", "DRYRUN") }
+        default { (Test-CheckoutSucceeded -Repo $Repo) -and (Test-PullAllowsChild -Repo $Repo) }
+    }
+}
+
+function Register-DependencyFailure {
+    param([object]$Repo, [string]$Message)
+    $operation = if ($Mode -eq "PullOnly") { "pull" } else { "checkout" }
+    Register-OperationResult -Repo $Repo -Result (ConvertTo-LocalResult -Repo $Repo -Operation $operation -Status "DEPENDENCY" -Message $Message)
+    $Repo.ReadyForChildren = $false
+}
+
+function Invoke-RepoGroup {
+    param([object[]]$Repos, [string]$SectionName)
+    if ($Repos.Count -eq 0) { return }
+    Write-Section $SectionName
+
+    $readyRepos = [System.Collections.Generic.List[object]]::new()
     foreach ($repo in $Repos) {
-        $counter++
-        Write-Host "  ($counter/$total) " -NoNewline -ForegroundColor DarkGray
-        $success = Invoke-GitOperation -RepoPath $repo.Path -RepoName $repo.Name -Operation $Operation
-        if ($success) {
-            $script:Stats.Success++
-        } else {
-            $script:Stats.Failed++
-            $script:FailedRepos.Add([PSCustomObject]@{ Name = $repo.Name; Path = $repo.RelativePath; Step = $Operation })
-        }
-    }
-}
+        if ($repo.Type -eq "Submodule") {
+            $parent = Get-RepoPlan -Path $repo.ParentPath
+            if ($null -eq $parent -or -not $parent.ReadyForChildren) {
+                Register-DependencyFailure -Repo $repo -Message "父仓库未成功完成，跳过此仓库及其后代"
+                continue
+            }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 主流程
-# ─────────────────────────────────────────────────────────────────────────────
+            $resolution = Get-TargetBranch -Repo $repo
+            if (-not $resolution.Valid) {
+                Register-DependencyFailure -Repo $repo -Message $resolution.Message
+                continue
+            }
+            if (-not $resolution.Registered) {
+                Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "SKIP" -Message "$($resolution.Message)，跳过已从目标版本移除的子模块")
+                $repo.ReadyForChildren = $false
+                continue
+            }
+
+            $repo.TargetBranch = $resolution.Branch
+            $repo.BranchSource = $resolution.Source
+            $repo.SubmoduleName = $resolution.SubmoduleName
+            $script:BranchStats[$resolution.Source]++
+        } else {
+            $repo.TargetBranch = $Branch
+            $repo.BranchSource = "Parameter"
+            $script:BranchStats.Parameter++
+        }
+        $readyRepos.Add($repo)
+    }
+
+    $ready = @($readyRepos)
+    if ($ready.Count -eq 0) { return }
+    if ($Mode -in @("All", "CheckoutOnly")) {
+        Invoke-AndRegisterBatch -Repos $ready -Operation "checkout"
+    }
+    if ($Mode -in @("All", "PullOnly")) {
+        $pullRepos = if ($Mode -eq "All") { @($ready | Where-Object { Test-CheckoutSucceeded -Repo $_ }) } else { $ready }
+        if ($Mode -eq "All") {
+            foreach ($repo in @($ready | Where-Object { -not (Test-CheckoutSucceeded -Repo $_) })) {
+                Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "pull" -Status "DEPENDENCY" -Message "checkout 未成功，禁止继续 pull")
+            }
+        }
+        Invoke-AndRegisterBatch -Repos $pullRepos -Operation "pull" -AssumeTargetCheckedOut:($DryRun -and $Mode -eq "All")
+    }
+    foreach ($repo in $ready) { $repo.ReadyForChildren = Get-RepoChildReadiness -Repo $repo }
+}
 
 $startTime = Get-Date
+Write-Banner "Git 安全批量 Checkout & Pull"
+Write-Host "  主目录:       $MainDir" -ForegroundColor White
+Write-Host "  主目标分支:   $Branch" -ForegroundColor Yellow
+Write-Host "  远程:         $Remote" -ForegroundColor White
+Write-Host "  模式:         $Mode" -ForegroundColor White
+Write-Host "  重试:         $RetryCount 次，间隔 ${RetryDelaySeconds}s（仅远端检查/fetch）" -ForegroundColor White
+Write-Host "  并行执行:     $(if ($Parallel) { "是，批次大小 $ThrottleLimit" } else { "否" })" -ForegroundColor White
+Write-Host "  仅处理子模块: $(if ($SubmodulesOnly) { "是" } else { "否" })" -ForegroundColor White
+Write-Host "  最大深度:     $MaxDepth" -ForegroundColor White
+Write-Host "  DryRun:        $(if ($DryRun) { "是（允许 fetch，不修改 HEAD/工作树）" } else { "否" })" -ForegroundColor $(if ($DryRun) { "Magenta" } else { "White" })
+Write-Host "  日志文件:     $logFile" -ForegroundColor DarkGray
+Write-GitBatchLog -Message "开始执行 | 主目录=$MainDir | 分支=$Branch | 远程=$Remote | 模式=$Mode | 并行=$($Parallel.IsPresent) | DryRun=$($DryRun.IsPresent)"
 
-Write-Banner "Git 批量 Checkout & Pull"
-
-Write-Host "  主目录:     " -NoNewline -ForegroundColor DarkGray
-Write-Host $MainDir -ForegroundColor White
-Write-Host "  目标分支:   " -NoNewline -ForegroundColor DarkGray
-Write-Host $Branch -ForegroundColor Yellow
-Write-Host "  远程:       " -NoNewline -ForegroundColor DarkGray
-Write-Host $Remote -ForegroundColor White
-Write-Host "  模式:       " -NoNewline -ForegroundColor DarkGray
-Write-Host $Mode -ForegroundColor White
-Write-Host "  重试次数:   " -NoNewline -ForegroundColor DarkGray
-Write-Host $RetryCount -ForegroundColor White
-Write-Host "  重试间隔:   " -NoNewline -ForegroundColor DarkGray
-Write-Host "${RetryDelaySeconds}s" -ForegroundColor White
-Write-Host "  并行执行:   " -NoNewline -ForegroundColor DarkGray
-Write-Host $(if ($Parallel) { "是 (批次大小: $ThrottleLimit)" } else { "否" }) -ForegroundColor White
-Write-Host "  最大深度:   " -NoNewline -ForegroundColor DarkGray
-Write-Host $MaxDepth -ForegroundColor White
-Write-Host "  日志文件:   " -NoNewline -ForegroundColor DarkGray
-Write-Host $logFile -ForegroundColor DarkGray
-if ($DryRun) {
-    Write-Host "  模拟运行:   " -NoNewline -ForegroundColor DarkGray
-    Write-Host "是 (不执行实际 git 命令)" -ForegroundColor Magenta
-}
-Write-Host ""
-
-Write-Log -Message "开始执行 | 主目录=$MainDir | 分支=$Branch | 远程=$Remote | 模式=$Mode | 并行=$($Parallel.IsPresent) | DryRun=$($DryRun.IsPresent)"
-
-# 扫描仓库
-Write-Section "扫描 Git 仓库"
-$allRepos = @(Find-GitRepos -Path $MainDir)
-
+Write-Section "扫描与分类 Git 仓库"
+$allRepos = @(Find-GitRepo -Path $MainDir)
 if ($allRepos.Count -eq 0) {
-    Write-Host "  未找到任何 Git 仓库！请检查主目录路径。" -ForegroundColor Red
-    Write-Log -Message "未找到 Git 仓库" -Level "ERROR"
+    Write-Host "  未找到任何 Git 仓库。" -ForegroundColor Red
+    Write-GitBatchLog -Message "未找到 Git 仓库" -Level "ERROR"
     if (-not $NoPause) { Read-Host "按 Enter 退出" }
-    exit 1
+    exit 2
 }
 
-# 过滤排除项
-$repos = [System.Collections.Generic.List[object]]::new()
-$excluded = [System.Collections.Generic.List[object]]::new()
-
+Initialize-RepoPlan -Repos $allRepos
+$activeRepos = [System.Collections.Generic.List[object]]::new()
 foreach ($repo in $allRepos) {
     if (Test-ShouldExclude -RelativePath $repo.RelativePath) {
-        $excluded.Add($repo)
+        $repo.Excluded = $true
         $script:Stats.Skipped++
-    } else {
-        $repos.Add($repo)
+        Write-Status -RepoName $repo.Name -Message "排除: $($repo.RelativePath)" -Level "SKIP"
+        continue
     }
+    if ($SubmodulesOnly -and $repo.Type -eq "Standalone") {
+        $repo.Excluded = $true
+        $script:Stats.Skipped++
+        Write-Status -RepoName $repo.Name -Message "非主仓库且非子模块，-SubmodulesOnly 跳过" -Level "SKIP"
+        continue
+    }
+    $activeRepos.Add($repo)
 }
 
-Write-Host ""
-Write-Host "  发现 " -NoNewline -ForegroundColor DarkGray
-Write-Host "$($allRepos.Count)" -NoNewline -ForegroundColor Green
-Write-Host " 个 Git 仓库，排除 " -NoNewline -ForegroundColor DarkGray
-Write-Host "$($excluded.Count)" -NoNewline -ForegroundColor Yellow
-Write-Host " 个，将处理 " -NoNewline -ForegroundColor DarkGray
-Write-Host "$($repos.Count)" -NoNewline -ForegroundColor Green
-Write-Host " 个" -ForegroundColor DarkGray
+$mainRepo = @($activeRepos | Where-Object { $_.Type -eq "Main" } | Select-Object -First 1)
+$submoduleCount = @($activeRepos | Where-Object { $_.Type -eq "Submodule" }).Count
+$standaloneCount = @($activeRepos | Where-Object { $_.Type -eq "Standalone" }).Count
+Write-Host "  发现 $($allRepos.Count) 个仓库：主仓库 $($mainRepo.Count)，子模块 $submoduleCount，独立仓库 $standaloneCount；实际处理 $($activeRepos.Count) 个" -ForegroundColor Gray
+Write-GitBatchLog -Message "发现=$($allRepos.Count) | 主仓库=$($mainRepo.Count) | 子模块=$submoduleCount | 独立仓库=$standaloneCount | 处理=$($activeRepos.Count)"
 
-Write-Log -Message "发现 $($allRepos.Count) 个仓库，排除 $($excluded.Count) 个，处理 $($repos.Count) 个"
-
-if ($excluded.Count -gt 0) {
-    Write-Host ""
-    foreach ($ex in $excluded) {
-        Write-Status -RepoName $ex.Name -Message "排除: $($ex.RelativePath)" -Level "SKIP"
-    }
+if ($mainRepo.Count -gt 0) {
+    $mainRepo[0].TargetBranch = $Branch
+    $mainRepo[0].BranchSource = "Parameter"
+    Invoke-RepoGroup -Repos @($mainRepo[0]) -SectionName "主仓库 -> $Branch"
+} else {
+    Write-Status -RepoName "SYSTEM" -Message "MainDir 本身不是 Git 仓库，将以扫描容器模式处理其余仓库" -Level "WARN"
 }
 
-# 执行 Checkout
-if ($Mode -in @("All", "CheckoutOnly")) {
-    Write-Section "Checkout -> $Branch ($($repos.Count) 个仓库)"
-    Write-Log -Message "开始 checkout -> $Branch"
-
-    if ($Parallel) {
-        Invoke-GitOperationParallel -Repos $repos -Operation "checkout" | Out-Null
-    } else {
-        Invoke-GitOperationSequential -Repos $repos -Operation "checkout"
-    }
+$childGroups = @($activeRepos | Where-Object { $_.Type -ne "Main" } | Group-Object -Property Depth | Sort-Object { [int]$_.Name })
+foreach ($group in $childGroups) {
+    $levelRepos = @($group.Group)
+    Invoke-RepoGroup -Repos $levelRepos -SectionName "第 $($group.Name) 层仓库（$($levelRepos.Count) 个）"
 }
 
-# 执行 Pull
-if ($Mode -in @("All", "PullOnly")) {
-    Write-Section "Pull $Remote/$Branch ($($repos.Count) 个仓库)"
-    Write-Log -Message "开始 pull $Remote/$Branch"
-
-    if ($Parallel) {
-        Invoke-GitOperationParallel -Repos $repos -Operation "pull" | Out-Null
-    } else {
-        Invoke-GitOperationSequential -Repos $repos -Operation "pull"
-    }
-}
-
-# 汇总报告
 $elapsed = (Get-Date) - $startTime
-$elapsedStr = "{0:mm\:ss}" -f $elapsed
-
+$elapsedStr = "{0:hh\:mm\:ss}" -f $elapsed
 Write-Host ""
 Write-Host ('═' * $script:TotalWidth) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  汇总报告" -ForegroundColor Cyan
+Write-Host "    成功:       $($script:Stats.Success)" -ForegroundColor Green
+Write-Host "    计划:       $($script:Stats.Planned)" -ForegroundColor Magenta
+Write-Host "    失败:       $($script:Stats.Failed)" -ForegroundColor $(if ($script:Stats.Failed -gt 0) { "Red" } else { "Green" })
+Write-Host "    跳过:       $($script:Stats.Skipped)" -ForegroundColor Yellow
+Write-Host "    依赖跳过:   $($script:Stats.DependencyFailed)" -ForegroundColor DarkYellow
+Write-Host "    耗时:       $elapsedStr" -ForegroundColor White
 Write-Host ""
-Write-Host "    成功:   " -NoNewline -ForegroundColor DarkGray
-Write-Host "$($script:Stats.Success)" -ForegroundColor Green
-Write-Host "    失败:   " -NoNewline -ForegroundColor DarkGray
-$failColor = if ($script:Stats.Failed -gt 0) { "Red" } else { "Green" }
-Write-Host "$($script:Stats.Failed)" -ForegroundColor $failColor
-Write-Host "    跳过:   " -NoNewline -ForegroundColor DarkGray
-Write-Host "$($script:Stats.Skipped)" -ForegroundColor Yellow
-Write-Host "    耗时:   " -NoNewline -ForegroundColor DarkGray
-Write-Host $elapsedStr -ForegroundColor White
+Write-Host "  分支来源" -ForegroundColor Cyan
+Write-Host "    参数:       $($script:BranchStats.Parameter)" -ForegroundColor Gray
+Write-Host "    .gitmodules: $($script:BranchStats.Gitmodules)" -ForegroundColor Gray
+Write-Host "    branch = .: $($script:BranchStats.Inherited)" -ForegroundColor Gray
+Write-Host "    回退参数:   $($script:BranchStats.Fallback)" -ForegroundColor Gray
 
 if ($script:FailedRepos.Count -gt 0) {
     Write-Host ""
     Write-Host "  失败仓库:" -ForegroundColor Red
-    Write-Host "  $('-' * 50)" -ForegroundColor DarkGray
-    foreach ($f in $script:FailedRepos) {
-        Write-Host "    X " -NoNewline -ForegroundColor Red
-        Write-Host "$($f.Step.PadRight(10))" -NoNewline -ForegroundColor DarkRed
-        Write-Host " $($f.Path)" -ForegroundColor Red
+    foreach ($failed in $script:FailedRepos) {
+        Write-Host "    X $($failed.Step.PadRight(10)) $($failed.Path)" -ForegroundColor Red
+        Write-Detail $failed.Message
     }
-    Write-Log -Message "失败仓库: $($script:FailedRepos | ForEach-Object { "$($_.Step):$($_.Path)" } | Join-String -Separator ', ')" -Level "ERROR"
-    $global:LASTEXITCODE = 1
-} else {
-    Write-Host ""
-    Write-Host "  所有操作均已成功完成！" -ForegroundColor Green
-    Write-Log -Message "全部成功完成" -Level "OK"
-    $global:LASTEXITCODE = 0
+    $failedSummary = [string]::Join(', ', @($script:FailedRepos | ForEach-Object { "$($_.Step):$($_.Path)" }))
+    Write-GitBatchLog -Message "失败仓库: $failedSummary" -Level "ERROR"
 }
 
+$exitCode = if ($script:Stats.Failed -gt 0 -or $script:Stats.DependencyFailed -gt 0) { 1 } else { 0 }
 Write-Host ""
 Write-Host "  日志: $logFile" -ForegroundColor DarkGray
-Write-Host ""
 Write-Host ('═' * $script:TotalWidth) -ForegroundColor Cyan
-Write-Host ""
-
-Write-Log -Message "执行完毕 | 成功=$($script:Stats.Success) | 失败=$($script:Stats.Failed) | 跳过=$($script:Stats.Skipped) | 耗时=$elapsedStr"
-
-if (-not $NoPause) {
-    Read-Host "按 Enter 退出"
-}
+Write-GitBatchLog -Message "执行完毕 | 成功=$($script:Stats.Success) | 计划=$($script:Stats.Planned) | 失败=$($script:Stats.Failed) | 跳过=$($script:Stats.Skipped) | 依赖跳过=$($script:Stats.DependencyFailed) | 耗时=$elapsedStr"
+if (-not $NoPause) { Read-Host "按 Enter 退出" }
+exit $exitCode
