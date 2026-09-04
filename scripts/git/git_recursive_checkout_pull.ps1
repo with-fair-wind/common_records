@@ -44,7 +44,7 @@ if (-not (Test-Path -LiteralPath $MainDir -PathType Container)) {
     exit 2
 }
 
-$MainDir = [System.IO.Path]::GetFullPath($MainDir).TrimEnd('\', '/')
+$MainDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($MainDir).TrimEnd('\', '/')
 if (-not (Test-Path -LiteralPath $LogDir -PathType Container)) {
     New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
 }
@@ -241,7 +241,8 @@ function Get-TargetBranch {
     }
     $baseArgs = Get-GitmodulesConfigArgument -ParentRepo $parent
     if ($null -eq $baseArgs) {
-        return [PSCustomObject]@{ Valid = $true; Registered = $false; Branch = $Branch; Source = "Fallback"; SubmoduleName = $null; Message = "父仓库目标版本不存在 .gitmodules" }
+        $reason = if ($DryRun) { "DryRun 未能取得父仓库目标引用" } else { "父仓库目标版本不存在 .gitmodules" }
+        return [PSCustomObject]@{ Valid = $true; Registered = $false; Branch = $Branch; Source = "Fallback"; SubmoduleName = $null; Message = $reason }
     }
 
     $keys = & git @baseArgs --name-only --get-regexp '^submodule\..*\.path$' 2>$null
@@ -370,7 +371,8 @@ $script:OperationWorker = {
             if ($checkoutCode -ne 0) {
                 return ConvertTo-WorkerResult -Status "FAIL" -ExitCode $checkoutCode -RemoteExists $remoteExists -LocalExists $localExists -Message "checkout 失败: $(($checkoutOutput | Out-String).Trim())"
             }
-            return ConvertTo-WorkerResult -Status "OK" -RemoteExists $remoteExists -LocalExists $true -MetadataRef $metadataRef -Message "checkout OK -> $TargetBranch"
+            $okSuffix = if ($remoteExists) { " -> $TargetBranch" } else { " -> $TargetBranch（远端无此分支，仅本地切换）" }
+            return ConvertTo-WorkerResult -Status "OK" -RemoteExists $remoteExists -LocalExists $true -MetadataRef $metadataRef -Message "checkout OK$okSuffix"
         }
 
         if (-not $remoteExists) {
@@ -452,10 +454,11 @@ function Invoke-RepositoryBatch {
         Wait-Job -Job @($jobEntries | ForEach-Object { $_.Job }) | Out-Null
         foreach ($entry in $jobEntries) {
             $received = @(Receive-Job -Job $entry.Job -ErrorAction SilentlyContinue)
+            $failureReason = if ($entry.Job.State -eq "Failed") { "$($entry.Job.ChildJobs[0].JobStateInfo.Reason)" } else { $null }
             Remove-Job -Job $entry.Job -Force | Out-Null
             $result = $received | Where-Object { $_.PSObject.Properties["Status"] } | Select-Object -Last 1
             if ($null -eq $result) {
-                $result = ConvertTo-LocalResult -Repo $entry.Repo -Operation $Operation -Status "FAIL" -Message "并行任务未返回有效结果"
+                $result = ConvertTo-LocalResult -Repo $entry.Repo -Operation $Operation -Status "FAIL" -Message "并行任务未返回有效结果$(if ($failureReason) { "：$failureReason" })"
             }
             $results.Add($result)
         }
@@ -508,7 +511,12 @@ function Invoke-RepoGroup {
         if ($repo.Type -eq "Submodule") {
             $parent = Get-RepoPlan -Path $repo.ParentPath
             if ($null -eq $parent -or -not $parent.ReadyForChildren) {
-                Register-DependencyFailure -Repo $repo -Message "父仓库未成功完成，跳过此仓库及其后代"
+                if ($null -ne $parent -and $parent.Excluded) {
+                    Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "SKIP" -Message "父仓库已被排除或跳过，跳过此仓库及其后代")
+                    $repo.ReadyForChildren = $false
+                } else {
+                    Register-DependencyFailure -Repo $repo -Message "父仓库未成功完成，跳过此仓库及其后代"
+                }
                 continue
             }
 
@@ -544,7 +552,11 @@ function Invoke-RepoGroup {
         $pullRepos = if ($Mode -eq "All") { @($ready | Where-Object { Test-CheckoutSucceeded -Repo $_ }) } else { $ready }
         if ($Mode -eq "All") {
             foreach ($repo in @($ready | Where-Object { -not (Test-CheckoutSucceeded -Repo $_) })) {
-                Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "pull" -Status "DEPENDENCY" -Message "checkout 未成功，禁止继续 pull")
+                if ($repo.CheckoutStatus -eq "SKIP") {
+                    Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "pull" -Status "SKIP" -Message "无目标分支，跳过 pull")
+                } else {
+                    Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "pull" -Status "DEPENDENCY" -Message "checkout 未成功，禁止继续 pull")
+                }
             }
         }
         Invoke-AndRegisterBatch -Repos $pullRepos -Operation "pull" -AssumeTargetCheckedOut:($DryRun -and $Mode -eq "All")
@@ -643,7 +655,11 @@ if ($script:FailedRepos.Count -gt 0) {
     Write-GitBatchLog -Message "失败仓库: $failedSummary" -Level "ERROR"
 }
 
-$exitCode = if ($script:Stats.Failed -gt 0 -or $script:Stats.DependencyFailed -gt 0) { 1 } else { 0 }
+$nothingExecuted = ($script:Stats.Success -eq 0 -and $script:Stats.Planned -eq 0 -and $activeRepos.Count -gt 0)
+if ($script:Stats.Failed -eq 0 -and $nothingExecuted) {
+    Write-Status -RepoName "SYSTEM" -Message "所有仓库均被跳过，未执行任何操作；请检查目标分支与排除规则" -Level "WARN"
+}
+$exitCode = if ($script:Stats.Failed -gt 0 -or $nothingExecuted) { 1 } else { 0 }
 Write-Host ""
 Write-Host "  日志: $logFile" -ForegroundColor DarkGray
 Write-Host ('═' * $script:TotalWidth) -ForegroundColor Cyan

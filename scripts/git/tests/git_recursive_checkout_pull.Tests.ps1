@@ -192,6 +192,36 @@ Describe "git_recursive_checkout_pull.ps1" {
         $result.Output | Should -Match '计划:\s+6'
     }
 
+    It "treats a missing target branch as skip instead of dependency failure" {
+        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "missing-branch") -SubmoduleBranch "ghost"
+        $result = Invoke-ScriptUnderTest -Fixture $fixture
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match '无目标分支，跳过 pull'
+        $result.Output | Should -Not -Match '父仓库未成功完成'
+    }
+
+    It "skips submodules of a SubmodulesOnly-skipped standalone without dependency failure" {
+        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "standalone-skip") -SubmoduleBranch "release"
+        $standalone = Join-Path $fixture.Main "extra"
+        Invoke-TestGitGlobal -ArgumentList @("init", "--initial-branch=developbim", $standalone)
+        Invoke-TestGit -Repository $standalone -ArgumentList @("config", "user.name", "Codex Test")
+        Invoke-TestGit -Repository $standalone -ArgumentList @("config", "user.email", "codex@example.invalid")
+        $helperModulesRoot = Join-Path $standalone ".git\modules"
+        New-Item -ItemType Directory -Path $helperModulesRoot -Force | Out-Null
+        Invoke-TestGitGlobal -ArgumentList @(
+            "clone", "--separate-git-dir=$(Join-Path $helperModulesRoot "helper")", "-b", "release", $fixture.ChildRemote, (Join-Path $standalone "helper")
+        )
+        # 在父仓库 index 中登记 gitlink，git 才会报告 superproject 关系
+        Invoke-TestGit -Repository $standalone -ArgumentList @("add", "helper")
+        $result = Invoke-ScriptUnderTest -Fixture $fixture -SubmodulesOnly
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'extra\s+非主仓库且非子模块'
+        $result.Output | Should -Match 'helper\s+父仓库已被排除或跳过，跳过此仓库及其后代'
+        $result.Output | Should -Not -Match '父仓库未成功完成'
+    }
+
     It "returns exit code 2 for a missing main directory" {
         $missingDirectory = Join-Path $TestDrive "does-not-exist"
         $output = & pwsh -NoProfile -File $scriptUnderTest -MainDir $missingDirectory -NoPause 2>&1 | Out-String
