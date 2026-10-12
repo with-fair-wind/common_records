@@ -123,7 +123,7 @@ function Add-HardLinkOrCopy {
     if ($sourceDrive -ieq $destinationDrive) {
         try {
             New-Item -ItemType HardLink -Path $Destination -Target $Source -ErrorAction Stop |
-                Out-Null
+            Out-Null
             return
         }
         catch {
@@ -170,17 +170,28 @@ if (-not (Test-Path -LiteralPath $CacheRoot)) {
 $env:SCOOP = $ScoopRoot
 $env:SCOOP_CACHE = $CacheRoot
 
-# 修改此数组即可扩展内网软件集。
-# 这里显式包含 7zip：它是 LLVM、VS Code、Windows Terminal 等压缩包的常用解压工具。
+# 当前仅启用 VC++ 运行库和 LaTeX；以下注释项是可选的软件清单。
+# 根据目标机器需要取消注释；7zip 等 manifest 明确依赖会由下方依赖解析补齐。
+# latex 是保留兼容的 MiKTeX 包名，新环境也可按需求改用 miktex。
 $RequestedPackages = @(
-    '7zip',
-    'clangd',
-    'cmake',
-    'ninja',
-    'llvm',
-    'extras/vscode',
-    'extras/windows-terminal',
-    'versions/windows-terminal-preview'
+    # '7zip',
+    # 'clangd',
+    # 'cmake',
+    # 'ninja',
+    # 'llvm',
+    # 'extras/vscode',
+    # 'extras/windows-terminal',
+    # 'versions/windows-terminal-preview',
+    # 'nodejs-lts',
+    # 'main/claude-code',
+    # 'extras/cc-switch',
+    # 'extras/miniconda3',
+    # 'pandoc',
+    # 'doxygen',
+    # 'graphviz',
+    # 'starship',
+    'extras/vcredist2022',
+    'latex'
 )
 
 # 递归通过 `scoop depends` 计算明确依赖闭包。
@@ -291,12 +302,12 @@ foreach ($spec in $downloadSpecs) {
     }
 
     $packageDetails.Add([PSCustomObject]@{
-        Spec       = $spec
-        Bucket     = $parts.Bucket
-        Name       = $parts.Name
-        Version    = $version
-        CacheFiles = @($matches.Name)
-    })
+            Spec       = $spec
+            Bucket     = $parts.Bucket
+            Name       = $parts.Name
+            Version    = $version
+            CacheFiles = @($matches.Name)
+        })
 
     foreach ($match in $matches) {
         $selectedCacheFiles.Add($match)
@@ -305,13 +316,13 @@ foreach ($spec in $downloadSpecs) {
 
 $selectedCacheFiles = @(
     $selectedCacheFiles |
-        Sort-Object FullName -Unique
+    Sort-Object FullName -Unique
 )
 
 $bundledBuckets = @(
     $packageDetails |
-        Select-Object -ExpandProperty Bucket -Unique |
-        Sort-Object
+    Select-Object -ExpandProperty Bucket -Unique |
+    Sort-Object
 )
 
 $buildRoot = "$BundleRoot.__building"
@@ -325,7 +336,7 @@ $bucketStage = Join-Path $buildRoot 'stage-buckets'
 $bundleCache = Join-Path $buildRoot 'cache'
 
 New-Item -ItemType Directory -Path @($coreStage, $bucketStage, $bundleCache) -Force |
-    Out-Null
+Out-Null
 
 # Scoop 自身位于 apps\scoop\current 的真实目录，不是普通应用的 version + current Junction 结构。
 Copy-DirectoryTree `
@@ -387,8 +398,8 @@ $metadata = [ordered]@{
 }
 
 $metadata |
-    ConvertTo-Json -Depth 8 |
-    Set-Content -LiteralPath (Join-Path $buildRoot 'bundle.json') -Encoding UTF8
+ConvertTo-Json -Depth 8 |
+Set-Content -LiteralPath (Join-Path $buildRoot 'bundle.json') -Encoding UTF8
 
 @(
     'Scoop Offline Bundle'
@@ -403,7 +414,7 @@ $metadata |
     'On a new intranet computer, run Install-ScoopOfflineBundle.ps1.'
     'On an already deployed intranet computer, run Update-ScoopOfflineBundle.ps1 first.'
 ) |
-    Set-Content -LiteralPath (Join-Path $buildRoot 'README.txt') -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $buildRoot 'README.txt') -Encoding UTF8
 
 # stage-core / stage-buckets 仅用于构建 zip；
 # 最终 Bundle 只保留压缩包、cache 与元数据，避免跨网同步大量小文件。
@@ -429,7 +440,7 @@ catch {
 
 $bundleSize = (
     Get-ChildItem -LiteralPath $BundleRoot -Recurse -File |
-        Measure-Object -Property Length -Sum
+    Measure-Object -Property Length -Sum
 ).Sum
 
 Write-Host "`n离线 Bundle 已生成。" -ForegroundColor Green

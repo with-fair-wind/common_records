@@ -13,7 +13,7 @@ param(
     # 只更新 Scoop 核心、main/extras bucket 与 cache，不更新已安装应用。
     [switch]$SkipAppUpdate,
 
-    # 若 Code / clangd / clang / cmake / ninja 正在运行，显式指定后会强制结束它们。
+    # 预检发现本次更新涉及的 GUI 应用运行时，显式指定后强制结束它们。
     [switch]$StopRunningProcesses,
 
     # 成功后保留最近多少份 core/bucket 备份。0 表示不保留。
@@ -431,35 +431,74 @@ if ($null -ne $bundledBucketsProperty) {
     }
 }
 
-# Scoop 更新会跳过正在运行的程序。这里先明确处理，避免脚本显示成功但 VS Code 实际未更新。
-$processNames = @('Code', 'clangd', 'clang', 'clang++', 'cmake', 'ninja', 'WindowsTerminal', 'WindowsTerminalPreview')
-$foundProcesses = foreach ($name in $processNames) {
-    Get-Process -Name $name -ErrorAction SilentlyContinue
+# 集中维护：已知"更新时必须先退出"的包 → 进程名映射。
+# 只拦真正有自更新风险的 GUI / 常驻应用；scoop 的版本目录机制（旧版本保留、current 重指向）
+# 允许运行中的 CLI 进程不阻塞更新。如需对构建工具保守拦截（中断可重跑构建），按需追加：
+#   'clangd' = @('clangd'); 'cmake' = @('cmake'); 'ninja' = @('ninja')
+$PackageProcessMap = @{
+    'vscode'                   = @('Code')
+    'windows-terminal'         = @('WindowsTerminal')
+    'windows-terminal-preview' = @('WindowsTerminal')
+    'cc-switch'                = @('cc-switch')
 }
 
-# Sort-Object 仅返回一个项目时会把它展开为标量；外层 @() 保证后续始终是数组。
-$runningProcesses = @(
-    @($foundProcesses) |
-        Sort-Object Id -Unique
+# 按本次 Bundle 实际要更新（且内网已安装）的应用动态确定拦截名单，
+# 避免与本次更新无关的进程被误拦；-SkipAppUpdate 语义下不更新应用，此处同样不拦。
+$pendingProcessNames = @(
+    if (-not $SkipAppUpdate) {
+        foreach ($entry in @($metadata.DownloadedPackages)) {
+            $spec = [string]$entry.Spec
+
+            if ([string]::IsNullOrWhiteSpace($spec)) { continue }
+
+            $plainName = Get-PackageNameFromSpec -Spec $spec
+
+            if ($PackageProcessMap.ContainsKey($plainName) -and
+                (Test-Path -LiteralPath (Join-Path $ScoopRoot "apps\$plainName\current"))) {
+                $PackageProcessMap[$plainName]
+            }
+        }
+    }
 )
 
-if ($runningProcesses.Count -gt 0) {
-    $processSummary = $runningProcesses |
-        ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" } |
+# Sort-Object -Unique 去重（map 展开后可能有重复进程名）。
+$pendingProcessNames = @(
+    $pendingProcessNames |
         Sort-Object -Unique
+)
 
-    if (-not $StopRunningProcesses) {
-        throw @"
+# Scoop 更新会跳过正在运行的程序。这里先明确处理，避免脚本显示成功但 VS Code 实际未更新。
+if ($pendingProcessNames.Count -gt 0) {
+    $foundProcesses = foreach ($name in $pendingProcessNames) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue
+    }
+
+    # Sort-Object 仅返回一个项目时会把它展开为标量；外层 @() 保证后续始终是数组。
+    $runningProcesses = @(
+        @($foundProcesses) |
+            Sort-Object Id -Unique
+    )
+
+    if ($runningProcesses.Count -gt 0) {
+        $processSummary = $runningProcesses |
+            ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" } |
+            Sort-Object -Unique
+
+        if (-not $StopRunningProcesses) {
+            throw @"
 以下进程正在运行：
 $($processSummary -join "`r`n")
 
 请先关闭它们后重试；或确认可强制终止后加 -StopRunningProcesses。
+注意：若本脚本运行在 VS Code 集成终端中且正在更新 vscode，属于自我更新死锁场景，
+必须在独立 PowerShell 窗口中重试。
 "@
-    }
+        }
 
-    Write-Warning "正在强制结束：$($processSummary -join ', ')"
-    $runningProcesses | Stop-Process -Force
-    Start-Sleep -Seconds 1
+        Write-Warning "正在强制结束：$($processSummary -join ', ')"
+        $runningProcesses | Stop-Process -Force
+        Start-Sleep -Seconds 1
+    }
 }
 
 # 先补齐 / 校验本地 cache。旧 cache 不删除，只新增 Bundle 中的新版本。
@@ -621,6 +660,34 @@ if (-not $SkipAppUpdate) {
     )
 
     if ($appsToUpdate.Count -gt 0) {
+        # 预检到此处已过 cache 拷贝耗时（期间应用可能重新启动），紧贴 scoop update
+        # 再检查一次正在更新的 GUI 应用，避免"边运行边卸载"死锁
+        #（典型场景：在 VS Code 集成终端里更新 vscode 自身）。
+        # 映射复用脚本顶部的 $PackageProcessMap；此处一律中断报错，不受 -StopRunningProcesses
+        # 影响——到了临界点强杀宿主（如脚本正跑在该应用的终端里）会中断脚本自身。
+        $blocking = foreach ($app in $appsToUpdate) {
+            $plainName = ($app -split '/')[-1]
+
+            if ($PackageProcessMap.ContainsKey($plainName)) {
+                foreach ($procName in $PackageProcessMap[$plainName]) {
+                    Get-Process -Name $procName -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        $blocking = @($blocking | Sort-Object Id -Unique)
+
+        if ($blocking.Count -gt 0) {
+            $blockingSummary = ($blocking |
+                    ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', '
+
+            throw @"
+scoop update 前检测到待更新应用的进程仍在运行：$blockingSummary
+若本脚本运行在 VS Code 集成终端中，这就是 vscode 更新卡死的原因：
+请在独立 PowerShell 窗口中运行，或先完全退出上述应用后重试。
+"@
+        }
+
         # 不传 scoop；核心已经由 Bundle 的 scoop-core.zip 替换。
         Invoke-ScoopChildProcess -Arguments (@('update') + $appsToUpdate)
     }

@@ -140,14 +140,14 @@ scoop update
 .\Build-ScoopOfflineBundle.ps1
 ```
 
-内网：先关闭 VS Code、clangd、CMake、Ninja 及使用 LLVM 的编译进程，然后执行：
+内网：在**独立的** PowerShell 窗口（不要用 VS Code 集成终端——更新 vscode 时会自我死锁）中执行：
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process
 .\Update-ScoopOfflineBundle.ps1
 ```
 
-若确认允许脚本自动结束这些进程：
+脚本会按本次更新的应用自动检测需要先退出的进程（见步骤 3）；若确认允许脚本自动结束这些进程：
 
 ```powershell
 .\Update-ScoopOfflineBundle.ps1 -StopRunningProcesses
@@ -351,20 +351,24 @@ Build 脚本将外网 Scoop 环境固定成一个可复制的离线快照：
 
 #### 步骤 2：定义目标软件集合
 
-默认目标集合：
+当前脚本启用的目标集合：
 
 ```powershell
 $RequestedPackages = @(
-    '7zip',
-    'clangd',
-    'cmake',
-    'ninja',
-    'llvm',
-    'extras/vscode'
+    'extras/vcredist2022',
+    'latex'
 )
 ```
 
-其中 `7zip` 被明确加入，是因为部分软件包需要 7-Zip 或相关解包流程。将新软件加入这个列表后，下一次构建会将其 manifest 对应的安装包带入 Bundle。
+脚本中保留了注释状态的可选清单，包括 7zip、clangd、CMake、Ninja、LLVM、VS Code、
+Windows Terminal、Node.js、Claude Code、cc-switch、Miniconda、Pandoc、Doxygen、Graphviz
+和 Starship；只有取消注释后才成为本次请求的软件。manifest 声明的依赖会自动解析并纳入
+Bundle，suggested 软件不会自动加入。不要将注释候选清单当作实际打包清单；以生成的
+`bundle.json` 中 `RequestedPackages` 和 `DownloadedPackages` 为准。
+
+当前本机 bucket 中的 `latex` manifest 已标注 Deprecated，它是 MiKTeX 的历史兼容包名；
+本次保留现有选择，新环境可按需求改用 `miktex`。VC++ 运行库 manifest 会执行系统安装器，
+部署时可能请求管理员权限。把新软件加入数组后，下一次构建会将其安装包带入 Bundle。
 
 #### 步骤 3：解析依赖并下载到外网 cache
 
@@ -692,7 +696,7 @@ D:\scoop\cache 中已有旧文件
 | `ScoopRoot` | `D:\scoop` | 已部署 Scoop 根目录 |
 | `CacheRoot` | 空 | 优先读取用户 `SCOOP_CACHE`；否则使用 `ScoopRoot\cache` |
 | `SkipAppUpdate` | 未启用 | 仅更新 Scoop 核心、bucket、cache，不更新应用 |
-| `StopRunningProcesses` | 未启用 | 自动强制关闭 Code/clangd/clang/cmake/ninja 进程 |
+| `StopRunningProcesses` | 未启用 | 预检时自动强制结束本次更新涉及的 GUI 应用进程（动态名单，如 vscode 的 `Code`） |
 | `KeepBackupCount` | `2` | 成功后保留最近多少份 core / bucket 回滚备份；`0` 为不保留 |
 
 ### 6.3 Update 脚本的执行步骤
@@ -739,23 +743,23 @@ extras\bucket
 
 #### 步骤 3：检测可能占用文件的进程
 
-脚本检查：
+进程名单**动态生成**：脚本维护一张"包名 → 进程名"映射表（`$PackageProcessMap`，当前登记
+vscode→`Code`、windows-terminal→`WindowsTerminal`、windows-terminal-preview→`WindowsTerminal`、
+cc-switch→`cc-switch`），再按**本次 Bundle 实际要更新且内网已安装**的应用过滤——与本次更新
+无关的包不进入检查名单。Terminal 正式版和 Preview 共用 `WindowsTerminal` 进程名，
+因此命中任一版本时会保守检查所有同名进程。`-SkipAppUpdate` 不执行应用进程检查。
+构建类 CLI（clangd/cmake/ninja 等）默认不拦：scoop 的版本目录机制
+允许运行中的进程不阻塞更新，且中断构建重跑即可；如需保守拦截，在脚本内映射表注释区按需追加。
 
-```text
-Code
-clangd
-clang
-clang++
-cmake
-ninja
-```
-
-默认发现任意进程就停止更新，防止更新只完成一半。
+检测分两道：预检（替换已部署核心和 bucket 之前）和紧贴 `scoop update` 的复检（防止 cache 拷贝期间应用
+重新启动）。预检默认发现进程就停止更新，防止更新只完成一半：
 
 - 手动关闭后重试：最安全；
-- 加 `-StopRunningProcesses`：脚本调用 `Stop-Process -Force` 强制结束。
+- 加 `-StopRunningProcesses`：预检调用 `Stop-Process -Force` 强制结束（复检不受此参数
+  影响，一律中断——强杀宿主终端会连带杀掉脚本自身）。
 
-注意：强制关闭 `Code` 会丢失未保存的编辑内容，因此只在确认没有未保存文件时使用。
+注意：强制关闭 `Code` 会丢失未保存的编辑内容，因此只在确认没有未保存文件时使用；
+在 VS Code 集成终端里更新 vscode 属于自我更新死锁场景，必须换独立窗口。
 
 #### 步骤 4：先补齐新 cache，保留旧 cache
 
@@ -851,7 +855,7 @@ D:\scoop\apps\<应用名>\current
 然后调用类似：
 
 ```powershell
-scoop update 7zip clangd cmake ninja llvm extras/vscode
+scoop update extras/vcredist2022 latex
 ```
 
 注意两点：
@@ -874,6 +878,21 @@ scoop update 7zip clangd cmake ninja llvm extras/vscode
 ```
 
 这会在本次更新成功后删除所有旧 core / bucket 备份；cache 旧文件仍会保留。
+
+---
+
+### 6.4 进程检查回归验证
+
+在仓库根目录使用已安装的 Pester 5 或更新版本运行：
+
+```powershell
+Invoke-Pester -Path .\scripts\scoop\tests\OfflineBundle.Process.Tests.ps1 -Output Detailed
+```
+
+测试只提取并执行脚本的进程预检与复检段，替代进程查询、进程终止和路径检查；覆盖
+`-SkipAppUpdate`、未安装/无关软件、单项结果、显式强制关闭、Terminal Preview 进程名、
+同名进程去重，以及预检后应用重新启动的复检。测试不会运行真实 Scoop 更新或结束应用；
+不能代替实际离线环境的安装/更新验收。
 
 ---
 
@@ -966,7 +985,7 @@ scoop update
 - 首次失败留下的半成品：确认无保留价值后使用 `-Force`；
 - 已正常使用过：不要用 Install，改用 Update。
 
-### 9.3 Update 检测到 `Code` 或 `clangd` 正在运行
+### 9.3 Update 检测到待更新的 GUI 应用正在运行
 
 优先手动关闭相关软件后重试：
 
@@ -980,7 +999,8 @@ scoop update
 .\Update-ScoopOfflineBundle.ps1 -StopRunningProcesses
 ```
 
-执行前保存 VS Code 中未保存文件。
+执行前保存相关应用中的未保存内容；若待更新目标是承载脚本的 VS Code 或 Windows Terminal，
+请换用不会被本次更新影响的终端，避免强制关闭宿主时同时中断脚本。
 
 ### 9.4 内网更新后某个包仍是旧版本
 
@@ -1123,7 +1143,7 @@ scoop update
 
 # 同步：D:\ScoopOfflineBundle → 内网 D:\ScoopOfflineBundle
 
-# 内网：先关闭 VS Code / 编译相关进程
+# 内网：在不会被本次更新影响的独立终端中运行，先退出待更新的 GUI 应用
 Set-ExecutionPolicy Bypass -Scope Process
 .\Update-ScoopOfflineBundle.ps1
 ```
@@ -1156,4 +1176,3 @@ scoop install extras/cursor --no-update-scoop
 | `D:\scoop\persist` | 用户 / 应用 | 默认否 | 设置、扩展、用户数据 |
 | `D:\scoop\offline-backups` | Update | 否 | core / bucket 更新回滚备份 |
 | `D:\ScoopOfflineBundle` | 外网 Build | 是，完整同步 | 离线发布物 |
-
