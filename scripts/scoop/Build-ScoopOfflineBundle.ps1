@@ -174,24 +174,26 @@ $env:SCOOP_CACHE = $CacheRoot
 # 根据目标机器需要取消注释；7zip 等 manifest 明确依赖会由下方依赖解析补齐。
 # latex 是保留兼容的 MiKTeX 包名，新环境也可按需求改用 miktex。
 $RequestedPackages = @(
-    # '7zip',
-    # 'clangd',
-    # 'cmake',
-    # 'ninja',
-    # 'llvm',
-    # 'extras/vscode',
+    '7zip',
+    'clangd',
+    'cmake',
+    'ninja',
+    'llvm',
+    'extras/vscode',
     # 'extras/windows-terminal',
-    # 'versions/windows-terminal-preview',
-    # 'nodejs-lts',
-    # 'main/claude-code',
-    # 'extras/cc-switch',
-    # 'extras/miniconda3',
-    # 'pandoc',
-    # 'doxygen',
-    # 'graphviz',
-    # 'starship',
+    'versions/windows-terminal-preview',
+    'nodejs-lts',
+    'main/claude-code',
+    'extras/cc-switch',
+    'extras/miniconda3',
+    'pandoc',
+    'doxygen',
+    'graphviz',
+    'starship',
     'extras/vcredist2022',
-    'latex'
+    'latex',
+    'cppcheck'
+    'oh-my-pi'
 )
 
 # 递归通过 `scoop depends` 计算明确依赖闭包。

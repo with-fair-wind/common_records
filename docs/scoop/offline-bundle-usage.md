@@ -4,7 +4,11 @@
 >
 > **默认路径**：外网与内网均以 `D:\scoop` 作为 Scoop 根目录，以 `D:\ScoopOfflineBundle` 作为离线 Bundle 目录。路径可以通过脚本参数调整，但三个脚本应保持一致。
 >
-> **Bundle 格式版本**：`FormatVersion = 1`。
+> **Bundle 格式版本**：Build 生成 `FormatVersion = 2`；Install / Update 兼容版本 1 和 2。
+
+脚本位置：[Build](../../scripts/scoop/Build-ScoopOfflineBundle.ps1)、[Install](../../scripts/scoop/Install-ScoopOfflineBundle.ps1)、[Update](../../scripts/scoop/Update-ScoopOfflineBundle.ps1)。三个脚本的参数与流程统一维护在本文。
+
+以下 `./Build-*`、`./Install-*`、`./Update-*` 命令从仓库的 `scripts/scoop/` 目录运行；回归测试命令从仓库根目录运行。
 
 ---
 
@@ -275,7 +279,7 @@ Set-ExecutionPolicy Bypass -Scope Process
 
 ```json
 {
-  "FormatVersion": 1,
+  "FormatVersion": 2,
   "CreatedAt": "2026-06-26 12:00:00",
   "Architecture": "64bit",
   "RequestedPackages": [
@@ -295,6 +299,7 @@ Set-ExecutionPolicy Bypass -Scope Process
       "CacheFiles": ["llvm#...#..."]
     }
   ],
+  "BundledBuckets": ["main", "extras"],
   "CacheFiles": [
     {
       "Name": "llvm#...#...",
@@ -319,7 +324,7 @@ Build 脚本将外网 Scoop 环境固定成一个可复制的离线快照：
 
 ```text
 当前 Scoop 核心
-+ 当前 main / extras manifest
++ 当前目标包涉及的 bucket manifest
 + 与当前 manifest 对应的下载缓存
 + 目标软件及其依赖信息
 = 一个可在内网安装或升级的 Bundle
@@ -351,24 +356,11 @@ Build 脚本将外网 Scoop 环境固定成一个可复制的离线快照：
 
 #### 步骤 2：定义目标软件集合
 
-当前脚本启用的目标集合：
+按目标机器需求编辑 [Build 脚本](../../scripts/scoop/Build-ScoopOfflineBundle.ps1) 中的 `$RequestedPackages`。以脚本中实际启用的条目为输入，不在文档重复维护一份容易过时的软件清单。
 
-```powershell
-$RequestedPackages = @(
-    'extras/vcredist2022',
-    'latex'
-)
-```
+manifest 声明的依赖会自动解析并纳入 Bundle，suggested 软件不会自动加入；最终打包结果以 `bundle.json` 的 `RequestedPackages` 和 `DownloadedPackages` 为准。
 
-脚本中保留了注释状态的可选清单，包括 7zip、clangd、CMake、Ninja、LLVM、VS Code、
-Windows Terminal、Node.js、Claude Code、cc-switch、Miniconda、Pandoc、Doxygen、Graphviz
-和 Starship；只有取消注释后才成为本次请求的软件。manifest 声明的依赖会自动解析并纳入
-Bundle，suggested 软件不会自动加入。不要将注释候选清单当作实际打包清单；以生成的
-`bundle.json` 中 `RequestedPackages` 和 `DownloadedPackages` 为准。
-
-当前本机 bucket 中的 `latex` manifest 已标注 Deprecated，它是 MiKTeX 的历史兼容包名；
-本次保留现有选择，新环境可按需求改用 `miktex`。VC++ 运行库 manifest 会执行系统安装器，
-部署时可能请求管理员权限。把新软件加入数组后，下一次构建会将其安装包带入 Bundle。
+把新软件加入数组后重新构建并同步完整 Bundle。运行库等软件的安装程序可能需要管理员权限，具体以所选包的安装行为为准。
 
 #### 步骤 3：解析依赖并下载到外网 cache
 
@@ -437,20 +429,16 @@ scoop-core.zip
 
 复制时排除 `.git`，因为离线运行 Scoop 不需要核心仓库的 Git 历史。
 
-#### 步骤 7：压缩完整 `main` 与 `extras` bucket
+#### 步骤 7：压缩涉及的完整 bucket
 
-脚本将外网：
+脚本根据目标包与依赖确定需要的 bucket，将其完整内容复制到暂存区，排除 `.git` 后打包为 `buckets.zip`。例如：
 
 ```text
 D:\scoop\buckets\main
 D:\scoop\buckets\extras
 ```
 
-复制到暂存区，并排除 `.git`，然后打包为：
-
-```text
-buckets.zip
-```
+实际列表写入 `bundle.json` 的 `BundledBuckets`，可能包含 `versions` 等其他 bucket，不固定为 main / extras。
 
 选择完整 bucket 而不是只复制当前使用的几个 JSON manifest，原因是内网仍可以正常执行：
 
@@ -544,7 +532,7 @@ cache\
 
 然后读取 `bundle.json`，确认：
 
-- `FormatVersion` 为 `1`；
+- `FormatVersion` 为 `1` 或 `2`；
 - Bundle 架构与内网机器一致；
 - `scoop-core.zip` 的 SHA-256 匹配；
 - `buckets.zip` 的 SHA-256 匹配。
@@ -577,7 +565,7 @@ D:\scoop\buckets\main\bucket
 D:\scoop\buckets\extras\bucket
 ```
 
-脚本会再次检查这些路径，确保 zip 内容层级正确。
+Scoop 主脚本必须存在。bucket 路径按 `BundledBuckets` 校验；旧 Bundle 没有该字段时，安装脚本回退检查 main / extras。上面的路径仅是示例。
 
 #### 步骤 4：校验并复制 cache
 
@@ -684,7 +672,7 @@ D:\scoop\apps\scoop\current\bin\scoop.ps1
 D:\scoop\apps\<应用>
 D:\scoop\persist
 D:\scoop\shims
-D:\scoop\buckets\除 main/extras 外的其他 bucket
+D:\scoop\buckets\本次 Bundle 未包含的其他 bucket
 D:\scoop\cache 中已有旧文件
 ```
 
@@ -694,7 +682,7 @@ D:\scoop\cache 中已有旧文件
 |---|---:|---|
 | `BundleRoot` | `D:\ScoopOfflineBundle` | 同步后的新 Bundle |
 | `ScoopRoot` | `D:\scoop` | 已部署 Scoop 根目录 |
-| `CacheRoot` | 空 | 优先读取用户 `SCOOP_CACHE`；否则使用 `ScoopRoot\cache` |
+| `CacheRoot` | 空 | 依次尝试用户 / 进程 `SCOOP_CACHE`、Scoop cache 配置，最后回退到 `ScoopRoot\cache` |
 | `SkipAppUpdate` | 未启用 | 仅更新 Scoop 核心、bucket、cache，不更新应用 |
 | `StopRunningProcesses` | 未启用 | 预检时自动强制结束本次更新涉及的 GUI 应用进程（动态名单，如 vscode 的 `Code`） |
 | `KeepBackupCount` | `2` | 成功后保留最近多少份 core / bucket 回滚备份；`0` 为不保留 |
@@ -731,7 +719,7 @@ D:\scoop\.offline-update\<时间戳-随机标识>\core
 D:\scoop\.offline-update\<时间戳-随机标识>\buckets
 ```
 
-并验证解压结构：
+并验证 Scoop 主脚本及解压得到的各 bucket 结构；若元数据声明了 `BundledBuckets`，还会检查声明的 bucket 均已解压。以下以 main / extras 为例：
 
 ```text
 apps\scoop\current\bin\scoop.ps1
@@ -776,9 +764,9 @@ cc-switch→`cc-switch`），再按**本次 Bundle 实际要更新且内网已�
 - 需要重装旧版时可继续复用；
 - 下一次 Bundle 可能仍引用部分相同依赖包。
 
-### 步骤 5：备份并替换 Scoop 核心与 main / extras bucket
+#### 步骤 5：备份并替换 Scoop 核心与 Bundle 内的 bucket
 
-Update 脚本只替换以下三部分：
+Update 脚本替换 Scoop 核心及 Bundle 内包含的 bucket，以下以 main / extras 为例：
 
 ```text
 D:\scoop\apps\scoop\current
@@ -1057,15 +1045,7 @@ buckets\extras
 
 ### 9.7 是否需要迁移 VS Code 配置和扩展
 
-默认不会迁移。
-
-若你希望内网保留外网 VS Code 的扩展、设置或 portable 数据，应单独同步：
-
-```text
-D:\scoop\persist\vscode
-```
-
-不要将它混入 Bundle 的核心更新逻辑；这样可以将“软件供应包”和“用户个性化配置”分开管理。
+Bundle 不迁移 VS Code 用户数据。扩展离线同步统一使用 [VS Code 扩展导出 / 安装流程](../vscode-cursor/offline-sync.md)，设置和 portable 数据按实际实例单独备份；不要将整个用户数据目录混入 Scoop 核心更新。
 
 ---
 
@@ -1118,51 +1098,7 @@ scoop bucket add <远程地址>
 
 ---
 
-## 11. 一页式操作清单
-
-### 首次部署
-
-```powershell
-# 外网
-scoop update
-.\Build-ScoopOfflineBundle.ps1
-
-# 同步：D:\ScoopOfflineBundle → 内网 D:\ScoopOfflineBundle
-
-# 内网
-Set-ExecutionPolicy Bypass -Scope Process
-.\Install-ScoopOfflineBundle.ps1
-```
-
-### 后续更新
-
-```powershell
-# 外网
-scoop update
-.\Build-ScoopOfflineBundle.ps1
-
-# 同步：D:\ScoopOfflineBundle → 内网 D:\ScoopOfflineBundle
-
-# 内网：在不会被本次更新影响的独立终端中运行，先退出待更新的 GUI 应用
-Set-ExecutionPolicy Bypass -Scope Process
-.\Update-ScoopOfflineBundle.ps1
-```
-
-### 加入一个新软件，例如 Cursor
-
-```powershell
-# 外网：在 Build 脚本 RequestedPackages 中添加 'extras/cursor'
-scoop update
-.\Build-ScoopOfflineBundle.ps1
-
-# 同步后，内网
-.\Update-ScoopOfflineBundle.ps1
-scoop install extras/cursor --no-update-scoop
-```
-
----
-
-## 12. 目录速查表
+## 11. 目录速查表
 
 | 路径 | 管理者 | 是否跨网同步 | 说明 |
 |---|---|---:|---|

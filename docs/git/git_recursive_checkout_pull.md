@@ -8,7 +8,7 @@
 - 已初始化的子模块优先使用直接父仓库 `.gitmodules` 中声明的分支。
 - 未声明子模块分支时，回退到主仓库目标分支。
 - 可选择同时处理目录树中的独立嵌套仓库，或者只处理主仓库和正式子模块。
-- 父仓库成功后才处理其子模块；checkout 失败后不会继续 pull。
+- 默认父仓库成功后才处理其子模块，可用 `-KeepGoing` 在父仓库失败后继续处理子模块；同一仓库 checkout 失败后不会继续 pull。
 - 输出终端汇总、日志和可供自动化调用的退出码。
 
 该脚本执行的是“按分支 checkout/pull”，不是 `git submodule update` 的替代品。
@@ -21,7 +21,7 @@
 - 初始化未初始化的子模块。
 - 按父仓库记录的 gitlink commit 检出子模块。
 - 自动创建远程分支。
-- 自动 stash、commit、reset 或丢弃本地修改。
+- 自动 stash、reset、为本地未提交修改创建提交，或丢弃本地修改。pull 在分支分叉时可能生成合并提交。
 - 自动解决 checkout、merge 或 pull 冲突。
 - 删除失效的子模块目录。
 
@@ -36,6 +36,8 @@
 | ThreadJob | 仅并行模式需要；不可用时自动回退顺序执行 |
 | PSScriptAnalyzer | 仅开发检查需要；已验证 1.25.0 |
 | Pester | 仅集成测试需要；要求 5.6.1+，已验证 6.1.0 |
+
+当前验证平台为 Windows、PowerShell 7.6.5、Git 2.56.0.windows.3。尚未逐一验证 PowerShell 7.0 至 7.5、其他 Git 版本及其他操作系统；路径比较按 Windows 的大小写规则处理，联接目录测试也依赖 Windows。
 
 ## 4. 参数
 
@@ -54,9 +56,12 @@
 | `-ExcludePatterns` | string[] | 空 | 追加路径排除规则 |
 | `-MaxDepth` | int | `5` | 文件系统递归扫描深度 |
 | `-SubmodulesOnly` | switch | 否 | 跳过非主仓库、非子模块的独立仓库 |
+| `-KeepGoing` | switch | 否 | 父仓库 checkout/pull 失败后，仍按其当前工作树的 `.gitmodules` 尝试处理子模块 |
 | `-NoPause` | switch | 否 | 完成后不等待 Enter，适用于 CI 或其他脚本调用 |
 
 数值参数会在绑定阶段校验：重试次数、间隔和深度不能为负数，并发数必须大于零。
+
+未知参数会在绑定阶段报错；旧的长参数名已移除，不提供兼容别名。`-ExcludePatterns` 的多值示例用于 PowerShell 内直接调用；从原生命令行使用 `pwsh -File` 时，数组参数受 PowerShell 自身的传参限制，建议通过 PowerShell 包装脚本以数组 splat 调用。
 
 ## 5. 仓库发现与分类
 
@@ -68,7 +73,7 @@
 | `Submodule` | Git 报告了直接 superproject，并且该父仓库位于扫描根目录内 | 读取父仓库 `.gitmodules` |
 | `Standalone` | 位于目录树中，但不是 Git 子模块 | 使用 `-Branch` |
 
-扫描会跳过以下普通目录：
+扫描会跳过目录联接、符号链接等重解析点，避免越出扫描根目录或重复遍历；也会跳过以下普通目录：
 
 - `node_modules`
 - `.git`
@@ -106,7 +111,7 @@ BIM\BmDb
 
 ## 6. 子模块目标分支
 
-子模块根据直接父仓库的目标版本解析 `.gitmodules`。
+正常执行时，子模块读取直接父仓库完成操作后的工作树 `.gitmodules`；配置语法错误会记录为失败，不会当作子模块已移除。DryRun 在 `CheckoutOnly` 下读取待切换的本地分支版本（本地分支不存在时读取远端版本），在计划 pull 后读取远端目标版本。启用 `-KeepGoing` 且父仓库操作失败时，改用父仓库当前工作树的 `.gitmodules`（包括 DryRun）；该配置可能与目标分支不同。`branch = .` 仍继承父仓库的目标分支。
 
 给定：
 
@@ -151,7 +156,7 @@ submodule.render-engine.branch
 安全约束：
 
 - checkout 失败后，同一仓库的 pull 标记为依赖失败，不再执行。
-- 父仓库未成功完成时，子模块及其后代均不执行。
+- 默认父仓库未成功完成时，子模块及其后代均不执行。
 - 远端分支不存在但本地分支存在时，仍可 checkout 本地分支，pull 被跳过。
 - 远端和本地都没有目标分支时，checkout 与 pull 均按正常跳过处理，不计入失败。
 
@@ -175,6 +180,24 @@ submodule.render-engine.branch
 
 脚本会先检查当前分支是否与目标分支完全一致。分支不一致或处于 detached HEAD 时拒绝 pull，防止把目标分支合并进错误的当前分支。
 
+分支名比较区分大小写。当前分支正确、但远端无该分支时，父仓库 pull 正常跳过，仍可继续处理其子模块。
+
+### KeepGoing
+
+启用 `-KeepGoing` 后，父仓库 checkout、远端检查/fetch 或 pull 失败时，仍尝试处理其子模块，适用于以上三种模式以及嵌套子模块。子模块自身失败时，也会继续尝试处理其子模块。
+
+- 使用失败父仓库当前工作树中的 `.gitmodules` 解析子模块；缺少配置或未登记该路径时仍跳过。
+- 被排除、被 `-SubmodulesOnly` 跳过或因本地和远端均无目标分支而跳过 checkout 的父仓库，不会因为此开关而恢复处理其后代。
+- 子模块自身 checkout 失败后仍禁止 pull；`PullOnly` 仍检查其当前分支。
+- 父仓库失败仍计入汇总，最终退出码仍为 `1`。
+
+```powershell
+.\git_recursive_checkout_pull.ps1 `
+    -MainDir "D:\work\main" `
+    -KeepGoing `
+    -NoPause
+```
+
 ## 8. 远端分支检查与重试
 
 每次操作会：
@@ -188,6 +211,8 @@ submodule.render-engine.branch
 该检查不依赖本地是否已经存在 `refs/remotes/<remote>/<branch>`，因此兼容单分支克隆和受限 fetch refspec。
 
 `RetryCount` 只应用于可能暂时恢复的远端查询和 fetch。checkout 与 pull 不自动重试，避免在冲突或部分合并状态下重复执行。
+
+fetch、checkout 和 pull 显式关闭 Git 自带的子模块递归，确保子模块遵守本脚本的分支、排除和依赖规则。pull 使用 `--no-rebase --no-autostash --no-edit --no-recurse-submodules`，即使仓库启用了 `merge.autoStash` 也不会自动 stash，合并提交消息不打开编辑器。
 
 ## 9. 并行处理
 
@@ -227,7 +252,7 @@ DryRun 不会：
 - 修改工作树。
 - 执行 pull 或 merge。
 
-允许 fetch 是为了确保 DryRun 解析出的子模块分支与真实执行一致。
+允许 fetch 是为了读取当前远端版本。DryRun 是执行计划，不会预演合并，因此不能保证真实 checkout/pull 成功；本地独有提交或未提交的 `.gitmodules` 修改也可能让实际子模块配置与计划不同。启用 `-KeepGoing` 且父仓库操作失败时，子模块配置回退到父仓库当前工作树。
 
 ## 11. 状态、日志与退出码
 
@@ -337,17 +362,41 @@ DryRun 不会：
 - 终端状态界面需要彩色 `Write-Host`。
 - 脚本只支持 PowerShell 7，因此使用 UTF-8 无 BOM。
 
-运行静态检查：
+以下命令从仓库根目录执行。运行静态检查：
 
 ```powershell
 Invoke-ScriptAnalyzer `
-    -Path . `
+    -Path .\scripts\git `
     -Recurse `
-    -Settings .\PSScriptAnalyzerSettings.psd1
+    -Settings .\scripts\git\PSScriptAnalyzerSettings.psd1
 ```
 
-运行集成测试：
+运行集成测试（`Run.Exit` 会以测试结果退出当前 PowerShell 进程，适合独立测试进程或 CI；交互使用时可省略此行）：
 
 ```powershell
-Invoke-Pester .\tests\git_recursive_checkout_pull.Tests.ps1
+Import-Module Pester -MinimumVersion 5.6.1
+$config = New-PesterConfiguration
+$config.Run.Path = '.\scripts\git\tests\git_recursive_checkout_pull.Tests.ps1'
+$config.Run.Exit = $true
+$config.Output.Verbosity = 'Detailed'
+# 测试只使用文件系统临时目录，不需要 Pester 的注册表测试盘。
+$config.TestRegistry.Enabled = $false
+Invoke-Pester -Configuration $config
 ```
+
+### 覆盖范围与验证边界
+
+测试通过本地临时 bare 仓库模拟远端，在独立 PowerShell 进程中执行脚本，检查退出码、实际分支/提交、本地修改和日志。
+
+| 范围 | 已覆盖场景 |
+|---|---|
+| 仓库发现 | 主仓库、容器模式、独立嵌套仓库、嵌套子模块、扫描深度、空目录、目录联接 |
+| 分支解析 | 子模块节名与路径不同、显式分支、`branch = .`、未配置分支时回退、路径带 `./`、配置损坏、远端移除子模块 |
+| 执行模式 | All、CheckoutOnly、PullOnly；本地分支存在或缺失；远端目标分支缺失；detached HEAD；分支名大小写 |
+| 依赖与排除 | 父仓库 checkout/pull 失败、KeepGoing 开关、独立仓库不受父仓库失败影响、嵌套排除、多条排除规则、全部排除 |
+| Git 配置与并行 | `merge.autoStash`、`submodule.recurse`、并行兄弟子模块、父仓库失败后并行继续、含 `[]` 的路径 |
+| 参数与结果 | 自定义远端、失败重试次数、非法数值和未知参数、退出码 0/1/2、日志完成记录、DryRun 不修改工作树 |
+
+测试尚未模拟真实 HTTP/SSH 认证、网络中断后恢复、远端同时更新、权限变化、磁盘写满和 ThreadJob 不可用或启动失败。也不包含所有合并冲突组合。现有用例通过代表上述场景通过，不代表所有运行环境和异常都已穷尽验证。
+
+测试运行在子进程中，未报告脚本的行覆盖率；不能将用例数量解释为覆盖率百分比。DryRun 的合并限制见第 10 节。

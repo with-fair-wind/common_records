@@ -1,0 +1,3 @@
+Checks: '-*,bugprone-use-after-move,modernize-use-nullptr,modernize-use-override'
+WarningsAsErrors: ''
+FormatStyle: file

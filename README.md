@@ -4,17 +4,11 @@
 
 ## 文档入口
 
-- [Git 脚本](docs/git.md)：Git 历史改写、多仓库 checkout/pull 自动化。
-- [文件同步脚本](docs/file-sync.md)：文件复制、同步与镜像工具。
-- [Scoop 离线部署脚本](docs/scoop.md)：Scoop 离线 Bundle 构建、首次安装与后续更新流程。
-- [VS Code / Cursor 脚本](docs/vscode-cursor.md)：扩展清单生成、VSIX 下载与批量安装。
+[统一文档导航](docs/README.md)：Git、文件同步、Scoop、Neovim / LazyVim、VS Code 和 omp。
 
 ## 脚本目录
 
-- `scripts/git/`：Git 相关自动化脚本。
-- `scripts/file-sync/`：文件同步脚本。
-- `scripts/scoop/`：Scoop 离线部署脚本。
-- `scripts/vscode-cursor/`：VS Code / Cursor 扩展管理脚本。
+脚本及配套配置、示例和测试按分类存放在 `scripts/` 下，具体入口见文档导航。
 
 ## Git 忽略规则
 
