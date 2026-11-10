@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-安全地批量切换并拉取主仓库、已初始化子模块和可选的独立嵌套仓库。
+安全地批量切换并拉取主仓库、子模块和可选的独立嵌套仓库。
 
 .DESCRIPTION
 主仓库和独立仓库使用 Branch 参数；子模块根据直接父仓库目标版本中的
@@ -9,9 +9,8 @@
 KeepGoing 允许父仓库操作失败后，按其当前工作树的 .gitmodules
 继续处理子模块；默认仍跳过失败父仓库的子模块。
 
-脚本不会克隆仓库、初始化子模块、按 gitlink commit 检出、自动 stash/reset，
-也不会自动解决冲突。DryRun 会 fetch 远端引用以准确解析目标 .gitmodules，
-但不会 checkout、pull 或修改工作树。
+All 和 CheckoutOnly 会初始化父仓库中新增或尚未初始化的子模块，再按分支处理。
+已移除子模块的本地文件会保留。DryRun 允许 fetch，但不会初始化子模块或修改工作树。
 #>
 #Requires -Version 7.0
 
@@ -62,6 +61,7 @@ $script:Stats = @{ Success = 0; Failed = 0; Skipped = 0; DependencyFailed = 0; P
 $script:FailedRepos = [System.Collections.Generic.List[object]]::new()
 $script:RepoIndex = @{}
 $script:BranchStats = @{ Gitmodules = 0; Inherited = 0; Fallback = 0; Parameter = 0 }
+$ignoredDirectoryNames = @("node_modules", ".git", "__pycache__", ".vs", ".idea")
 
 function Write-GitBatchLog {
     param(
@@ -143,32 +143,37 @@ function Get-RelativePath {
     return $target
 }
 
+function ConvertTo-RepoPlan {
+    param([string]$Path, [int]$Depth, [string]$Type = "Standalone", [string]$ParentPath)
+    [PSCustomObject]@{
+        Path = Get-NormalizedPath -Path $Path
+        Name = Split-Path $Path -Leaf
+        RelativePath = Get-RelativePath -BasePath $MainDir -TargetPath $Path
+        Type = $Type
+        ParentPath = $ParentPath
+        SubmoduleName = $null
+        Depth = $Depth
+        TargetBranch = $null
+        BranchSource = $null
+        MetadataRef = $null
+        GitlinkPaths = $null
+        CheckoutStatus = $null
+        PullStatus = $null
+        ReadyForChildren = $false
+        Excluded = $false
+    }
+}
+
 function Find-GitRepo {
     param([string]$Path, [int]$CurrentDepth = 0)
     if ($CurrentDepth -gt $MaxDepth) { return }
 
     if (Test-Path -LiteralPath (Join-Path $Path ".git")) {
-        $relativePath = Get-RelativePath -BasePath $MainDir -TargetPath $Path
-        [PSCustomObject]@{
-            Path = Get-NormalizedPath -Path $Path
-            Name = Split-Path $Path -Leaf
-            RelativePath = $relativePath
-            Type = "Standalone"
-            ParentPath = $null
-            SubmoduleName = $null
-            Depth = if ($relativePath -eq ".") { 0 } else { ($relativePath -split '[\\/]').Count }
-            TargetBranch = $null
-            BranchSource = $null
-            MetadataRef = $null
-            CheckoutStatus = $null
-            PullStatus = $null
-            ReadyForChildren = $false
-            Excluded = $false
-        }
+        ConvertTo-RepoPlan -Path $Path -Depth $CurrentDepth
     }
 
     foreach ($child in @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue)) {
-        if ($child.Name -in @("node_modules", ".git", "__pycache__", ".vs", ".idea")) { continue }
+        if ($child.Name -in $ignoredDirectoryNames) { continue }
         if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
         Find-GitRepo -Path $child.FullName -CurrentDepth ($CurrentDepth + 1)
     }
@@ -212,6 +217,25 @@ function Initialize-RepoPlan {
         $superOutput = & git -C $repo.Path rev-parse --show-superproject-working-tree 2>$null
         $superCode = $LASTEXITCODE
         $super = $superOutput | Select-Object -First 1
+        if ($superCode -eq 0 -and -not $super -and (Test-Path -LiteralPath (Join-Path $repo.Path ".git") -PathType Leaf)) {
+            # 已移除的子模块可能仍使用父仓库 .git/modules 中的 Git 目录。
+            $repoGitDir = & git -C $repo.Path rev-parse --absolute-git-dir 2>$null
+            $ancestor = Split-Path $repo.Path -Parent
+            while ($repoGitDir -and $ancestor) {
+                if (Get-RepoPlan -Path $ancestor) {
+                    $ancestorGitDir = & git -C $ancestor rev-parse --absolute-git-dir 2>$null
+                    if ($LASTEXITCODE -eq 0 -and $ancestorGitDir) {
+                        $modulePrefix = (Get-NormalizedPath -Path (Join-Path $ancestorGitDir "modules")) + [IO.Path]::DirectorySeparatorChar
+                        if ((Get-NormalizedPath -Path $repoGitDir).StartsWith($modulePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                            $super = $ancestor
+                            break
+                        }
+                    }
+                }
+                if ($ancestor -ieq $MainDir) { break }
+                $ancestor = Split-Path $ancestor -Parent
+            }
+        }
         if ($superCode -eq 0 -and $super) {
             $superPath = Get-NormalizedPath -Path "$($super.Trim())"
             $rootPrefix = $MainDir.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
@@ -526,6 +550,101 @@ function Register-DependencyFailure {
     $Repo.ReadyForChildren = $false
 }
 
+function Test-ContinueAfterParentFailure {
+    param([object]$ParentRepo)
+    return $KeepGoing -and $null -ne $ParentRepo -and -not $ParentRepo.Excluded -and
+        ($ParentRepo.CheckoutStatus -eq "FAIL" -or $ParentRepo.PullStatus -eq "FAIL")
+}
+
+function Initialize-MissingSubmodule {
+    param([object]$ParentRepo)
+    $continueAfterFailure = Test-ContinueAfterParentFailure -ParentRepo $ParentRepo
+    if ($ParentRepo.Depth -ge $MaxDepth -or (-not $ParentRepo.ReadyForChildren -and -not $continueAfterFailure)) { return }
+    $configArguments = Get-GitmodulesConfigArgument -ParentRepo $ParentRepo
+    if (-not $configArguments) { return }
+
+    $ParentRepo.GitlinkPaths = @{}
+    if ($DryRun -and $ParentRepo.ReadyForChildren) {
+        $entries = & git -C $ParentRepo.Path ls-tree -r -z $ParentRepo.MetadataRef 2>&1
+        $gitlinkPattern = '^160000 commit [0-9a-f]+\t(.+)$'
+    } else {
+        $entries = & git -C $ParentRepo.Path ls-files --stage -z 2>&1
+        # 父仓库合并失败时，stage 2 记录冲突路径的本地一侧。
+        $stagePattern = if ($continueAfterFailure) { '[02]' } else { '0' }
+        $gitlinkPattern = "^160000 [0-9a-f]+ $stagePattern\t(.+)$"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Register-OperationResult -Repo $ParentRepo -Result (ConvertTo-LocalResult -Repo $ParentRepo -Operation "discover" -Status "FAIL" -Message "读取子模块记录失败: $(($entries | Out-String).Trim())")
+        $ParentRepo.ReadyForChildren = $false
+        return
+    }
+
+    foreach ($entry in (($entries -join "`n") -split '\x00')) {
+        if ($entry -cnotmatch $gitlinkPattern) { continue }
+        $modulePath = $Matches[1]
+        $ParentRepo.GitlinkPaths[$modulePath] = $true
+        if (-not $ParentRepo.ReadyForChildren) { continue }
+        $parts = $modulePath.Split('/')
+        $depth = $ParentRepo.Depth + $parts.Count
+        if ($depth -gt $MaxDepth -or [IO.Path]::IsPathRooted($modulePath) -or $modulePath.Contains('\')) { continue }
+        if ($parts | Where-Object { $_ -in $ignoredDirectoryNames -or $_ -in @('', '.', '..') }) { continue }
+        $path = Get-NormalizedPath -Path (Join-Path $ParentRepo.Path $modulePath)
+        $existingRepo = Get-RepoPlan -Path $path
+        if ($existingRepo -and ($existingRepo.Type -ne "Standalone" -or $existingRepo.Excluded)) { continue }
+
+        $repo = ConvertTo-RepoPlan -Path $path -Depth $depth -Type "Submodule" -ParentPath $ParentRepo.Path
+        if (Test-ShouldExclude -RelativePath $repo.RelativePath) {
+            Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "init" -Status "SKIP" -Message "排除: $($repo.RelativePath)")
+            continue
+        }
+        $directory = $ParentRepo.Path
+        $isLinked = $false
+        foreach ($part in $parts) {
+            $directory = Join-Path $directory $part
+            $item = Get-Item -LiteralPath $directory -Force -ErrorAction SilentlyContinue
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                $isLinked = $true
+                break
+            }
+        }
+        if ($isLinked) { continue }
+
+        $resolution = Get-TargetBranch -Repo $repo
+        if (-not $resolution.Valid) {
+            Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "FAIL" -Message $resolution.Message)
+            continue
+        }
+        if (-not $resolution.Registered) { continue }
+        if ($existingRepo) {
+            $existingRepo.Type = "Submodule"
+            $existingRepo.ParentPath = $ParentRepo.Path
+            continue
+        }
+        if (Test-Path -LiteralPath (Join-Path $path ".git")) {
+            $script:RepoIndex[(Get-PathKey -Path $path)] = $repo
+            $repo
+            continue
+        }
+        if ($Mode -eq "PullOnly") {
+            Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "init" -Status "SKIP" -Message "子模块尚未初始化，请使用 -Mode All 初始化并同步")
+            continue
+        }
+        if ($DryRun) {
+            Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "init" -Status "DRYRUN" -Message "计划: 初始化子模块 $($repo.RelativePath)，目标分支 $($resolution.Branch)")
+            continue
+        }
+
+        $output = & git -C $ParentRepo.Path --literal-pathspecs -c submodule.recurse=false -c "clone.defaultRemoteName=$Remote" submodule update --init --checkout -- $modulePath 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $path ".git"))) {
+            Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "init" -Status "FAIL" -Message "初始化子模块失败: $(($output | Out-String).Trim())")
+            continue
+        }
+        Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "init" -Status "OK" -Message "已初始化子模块 $($repo.RelativePath)")
+        $script:RepoIndex[(Get-PathKey -Path $path)] = $repo
+        $repo
+    }
+}
+
 function Invoke-RepoGroup {
     param([object[]]$Repos, [string]$SectionName)
     if ($Repos.Count -eq 0) { return }
@@ -533,10 +652,14 @@ function Invoke-RepoGroup {
 
     $readyRepos = [System.Collections.Generic.List[object]]::new()
     foreach ($repo in $Repos) {
+        if ($SubmodulesOnly -and $repo.Type -eq "Standalone") {
+            $repo.Excluded = $true
+            Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "SKIP" -Message "非主仓库且非子模块，-SubmodulesOnly 跳过")
+            continue
+        }
         if ($repo.Type -eq "Submodule") {
             $parent = Get-RepoPlan -Path $repo.ParentPath
-            $continueAfterParentFailure = $KeepGoing -and $null -ne $parent -and
-                -not $parent.Excluded -and ($parent.CheckoutStatus -eq "FAIL" -or $parent.PullStatus -eq "FAIL")
+            $continueAfterParentFailure = Test-ContinueAfterParentFailure -ParentRepo $parent
             if ($null -eq $parent -or -not $parent.ReadyForChildren) {
                 if ($null -ne $parent -and $parent.Excluded) {
                     Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "SKIP" -Message "父仓库已被排除或跳过，跳过此仓库及其后代")
@@ -557,8 +680,15 @@ function Invoke-RepoGroup {
                 $repo.ReadyForChildren = $false
                 continue
             }
-            if (-not $resolution.Registered) {
-                Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "SKIP" -Message "$($resolution.Message)，跳过已从目标版本移除的子模块")
+            $skipReason = $resolution.Message
+            if ($resolution.Registered -and $null -ne $parent.GitlinkPaths) {
+                $pathInParent = (Get-RelativePath -BasePath $parent.Path -TargetPath $repo.Path).Replace('\', '/')
+                if (-not $parent.GitlinkPaths.ContainsKey($pathInParent)) {
+                    $skipReason = "父仓库目标版本缺少此子模块的 gitlink"
+                }
+            }
+            if ($skipReason) {
+                Register-OperationResult -Repo $repo -Result (ConvertTo-LocalResult -Repo $repo -Operation "resolve" -Status "SKIP" -Message "$skipReason，跳过已从目标版本移除的子模块")
                 $repo.ReadyForChildren = $false
                 $repo.Excluded = $true
                 continue
@@ -594,7 +724,10 @@ function Invoke-RepoGroup {
         }
         Invoke-AndRegisterBatch -Repos $pullRepos -Operation "pull" -AssumeTargetCheckedOut:($DryRun -and $Mode -eq "All")
     }
-    foreach ($repo in $ready) { $repo.ReadyForChildren = Get-RepoChildReadiness -Repo $repo }
+    foreach ($repo in $ready) {
+        $repo.ReadyForChildren = Get-RepoChildReadiness -Repo $repo
+        Initialize-MissingSubmodule -ParentRepo $repo
+    }
 }
 
 $startTime = Get-Date
@@ -630,34 +763,30 @@ foreach ($repo in $allRepos) {
         Write-Status -RepoName $repo.Name -Message "排除: $($repo.RelativePath)" -Level "SKIP"
         continue
     }
-    if ($SubmodulesOnly -and $repo.Type -eq "Standalone") {
-        $repo.Excluded = $true
-        $script:Stats.Skipped++
-        Write-Status -RepoName $repo.Name -Message "非主仓库且非子模块，-SubmodulesOnly 跳过" -Level "SKIP"
-        continue
-    }
     $activeRepos.Add($repo)
 }
 
 $mainRepo = @($activeRepos | Where-Object { $_.Type -eq "Main" } | Select-Object -First 1)
 $submoduleCount = @($activeRepos | Where-Object { $_.Type -eq "Submodule" }).Count
 $standaloneCount = @($activeRepos | Where-Object { $_.Type -eq "Standalone" }).Count
-Write-Host "  发现 $($allRepos.Count) 个仓库：主仓库 $($mainRepo.Count)，子模块 $submoduleCount，独立仓库 $standaloneCount；实际处理 $($activeRepos.Count) 个" -ForegroundColor Gray
+Write-Host "  初始发现 $($allRepos.Count) 个仓库：主仓库 $($mainRepo.Count)，子模块 $submoduleCount，独立仓库 $standaloneCount；待检查 $($activeRepos.Count) 个" -ForegroundColor Gray
 Write-GitBatchLog -Message "发现=$($allRepos.Count) | 主仓库=$($mainRepo.Count) | 子模块=$submoduleCount | 独立仓库=$standaloneCount | 处理=$($activeRepos.Count)"
 
+$pendingRepos = @($activeRepos | Where-Object { $_.Type -ne "Main" })
 if ($mainRepo.Count -gt 0) {
     $mainRepo[0].TargetBranch = $Branch
     $mainRepo[0].BranchSource = "Parameter"
-    Invoke-RepoGroup -Repos @($mainRepo[0]) -SectionName "主仓库 -> $Branch"
+    $pendingRepos += @(Invoke-RepoGroup -Repos @($mainRepo[0]) -SectionName "主仓库 -> $Branch")
 } else {
     $mainMessage = if (@($allRepos | Where-Object { $_.Type -eq "Main" }).Count -gt 0) { "主仓库已被排除，其子模块也将跳过" } else { "MainDir 本身不是 Git 仓库，将以扫描容器模式处理其余仓库" }
     Write-Status -RepoName "SYSTEM" -Message $mainMessage -Level "WARN"
 }
 
-$childGroups = @($activeRepos | Where-Object { $_.Type -ne "Main" } | Group-Object -Property Depth | Sort-Object { [int]$_.Name })
-foreach ($group in $childGroups) {
-    $levelRepos = @($group.Group)
-    Invoke-RepoGroup -Repos $levelRepos -SectionName "第 $($group.Name) 层仓库（$($levelRepos.Count) 个）"
+while ($pendingRepos.Count -gt 0) {
+    $depth = ($pendingRepos | Measure-Object -Property Depth -Minimum).Minimum
+    $levelRepos = @($pendingRepos | Where-Object { $_.Depth -eq $depth })
+    $pendingRepos = @($pendingRepos | Where-Object { $_.Depth -gt $depth })
+    $pendingRepos += @(Invoke-RepoGroup -Repos $levelRepos -SectionName "第 $depth 层仓库（$($levelRepos.Count) 个）")
 }
 
 $elapsed = (Get-Date) - $startTime

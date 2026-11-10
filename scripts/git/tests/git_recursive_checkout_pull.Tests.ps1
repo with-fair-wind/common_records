@@ -155,6 +155,15 @@ BeforeAll {
         Invoke-TestGit -Repository $Fixture.FirstChild -ArgumentList @("push", "origin", "release")
         return $nested
     }
+
+    function Add-TestGitlink {
+        param([string]$Repository, [string]$Name, [string]$Path, [string]$Url, [string]$Commit, [string]$Branch)
+        Invoke-TestGit -Repository $Repository -ArgumentList @("config", "--file", ".gitmodules", "submodule.$Name.path", $Path)
+        Invoke-TestGit -Repository $Repository -ArgumentList @("config", "--file", ".gitmodules", "submodule.$Name.url", $Url.Replace('\', '/'))
+        Invoke-TestGit -Repository $Repository -ArgumentList @("config", "--file", ".gitmodules", "submodule.$Name.branch", $Branch)
+        Invoke-TestGit -Repository $Repository -ArgumentList @("add", ".gitmodules")
+        Invoke-TestGit -Repository $Repository -ArgumentList @("update-index", "--add", "--cacheinfo", "160000,$Commit,$Path")
+    }
 }
 
 Describe "git_recursive_checkout_pull.ps1" {
@@ -472,14 +481,16 @@ Describe "git_recursive_checkout_pull.ps1" {
         $result.Output | Should -Match '回退参数:\s+1'
     }
 
-    It "skips a submodule removed by a remote update" -ForEach @(
-        @{ DryRun = $false }
-        @{ DryRun = $true }
+    It "skips a submodule removed by a remote update with DryRun=<DryRun> StaleConfig=<StaleConfig>" -ForEach @(
+        @{ DryRun = $false; StaleConfig = $false }
+        @{ DryRun = $true; StaleConfig = $false }
+        @{ DryRun = $false; StaleConfig = $true }
+        @{ DryRun = $true; StaleConfig = $true }
     ) {
-        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "removed-$DryRun")
+        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "removed-$DryRun-$StaleConfig")
         $source = Invoke-TestMainSourceSetup -Fixture $fixture
         Invoke-TestGit -Repository $source -ArgumentList @("rm", "--cached", "modules/child")
-        Invoke-TestGit -Repository $source -ArgumentList @("rm", ".gitmodules")
+        if (-not $StaleConfig) { Invoke-TestGit -Repository $source -ArgumentList @("rm", ".gitmodules") }
         Invoke-TestGit -Repository $source -ArgumentList @("commit", "-m", "remove submodule")
         Invoke-TestGit -Repository $source -ArgumentList @("push", "origin", "developbim")
         $originalChildHead = & git -C $fixture.FirstChild rev-parse HEAD
@@ -488,8 +499,110 @@ Describe "git_recursive_checkout_pull.ps1" {
 
         $result.ExitCode | Should -Be 0
         $result.Output | Should -Match 'child\s+.*跳过已从目标版本移除的子模块'
+        if ($StaleConfig) { $result.Output | Should -Match '缺少此子模块的 gitlink' }
         (& git -C $fixture.FirstChild rev-parse HEAD) | Should -Be $originalChildHead
         (& git -C $fixture.FirstChild branch --show-current) | Should -Be "release"
+        if (-not $DryRun) {
+            Set-Content -LiteralPath (Join-Path $fixture.FirstChild "local-only.txt") -Value "keep my files"
+            $secondRun = Invoke-ScriptUnderTest -Fixture $fixture
+            $secondRun.ExitCode | Should -Be 0
+            $secondRun.Output | Should -Match 'child\s+.*跳过已从目标版本移除的子模块'
+            Get-Content -LiteralPath (Join-Path $fixture.FirstChild "local-only.txt") | Should -Be "keep my files"
+            (& git -C $fixture.FirstChild branch --show-current) | Should -Be "release"
+            if ($StaleConfig) {
+                Invoke-TestGit -Repository $fixture.Main -ArgumentList @("remote", "set-url", "origin", (Join-Path $fixture.Root "missing.git"))
+                $failedRun = Invoke-ScriptUnderTest -Fixture $fixture -KeepGoing
+                $failedRun.ExitCode | Should -Be 1
+                $failedRun.Output | Should -Match 'child\s+.*缺少此子模块的 gitlink'
+                $failedRun.Output | Should -Not -Match 'child\s+(checkout|pull) OK'
+            }
+        }
+    }
+
+    It "initializes newly pulled submodules and nested additions in the same run with <Remote>" -ForEach @(
+        @{ Remote = "origin"; Broken = $false; ExpectedExitCode = 0 }
+        @{ Remote = "upstream"; Broken = $true; ExpectedExitCode = 1 }
+    ) {
+        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "new-nested-$Remote")
+        $originalCommit = & git -C $fixture.ChildSource rev-parse HEAD
+        Invoke-TestGit -Repository $fixture.ChildSource -ArgumentList @("checkout", "-b", "fresh")
+        Add-TestGitlink -Repository $fixture.ChildSource -Name "inner" -Path "nested" -Url $fixture.ChildRemote -Commit $originalCommit -Branch "developbim"
+        Invoke-TestGit -Repository $fixture.ChildSource -ArgumentList @("commit", "-m", "add nested module")
+        Invoke-TestGit -Repository $fixture.ChildSource -ArgumentList @("push", "origin", "fresh")
+        $freshCommit = & git -C $fixture.ChildSource rev-parse HEAD
+
+        $source = Invoke-TestMainSourceSetup -Fixture $fixture
+        Add-TestGitlink -Repository $source -Name "new-module" -Path "modules/new [module]" -Url $fixture.ChildRemote -Commit $originalCommit -Branch "fresh"
+        Add-TestGitlink -Repository $source -Name "excluded-module" -Path "modules/ignored" -Url $fixture.ChildRemote -Commit $originalCommit -Branch "release"
+        if ($Broken) {
+            Add-TestGitlink -Repository $source -Name "broken-module" -Path "modules/broken" -Url (Join-Path $fixture.Root "missing.git") -Commit $originalCommit -Branch "release"
+        }
+        Invoke-TestGit -Repository $source -ArgumentList @("commit", "-m", "add new modules")
+        Invoke-TestGit -Repository $source -ArgumentList @("push", "origin", "developbim")
+        if ($Remote -ne "origin") {
+            Invoke-TestGit -Repository $fixture.Main -ArgumentList @("remote", "rename", "origin", $Remote)
+            Invoke-TestGit -Repository $fixture.FirstChild -ArgumentList @("remote", "rename", "origin", $Remote)
+        }
+
+        # 本地 bare 仓库模拟远端，单独为该用例放行 file 传输。
+        $priorProtocols = $env:GIT_ALLOW_PROTOCOL
+        try {
+            $env:GIT_ALLOW_PROTOCOL = "file"
+            $result = Invoke-ScriptUnderTest -Fixture $fixture -Parallel -SubmodulesOnly -ExcludePatterns "modules/ignored" -Options @{ Remote = $Remote }
+        } finally {
+            $env:GIT_ALLOW_PROTOCOL = $priorProtocols
+        }
+
+        $result.Output | Should -Match 'nested\s+pull OK'
+        $result.ExitCode | Should -Be $ExpectedExitCode
+        if ($Broken) { $result.Output | Should -Match 'broken\s+初始化子模块失败' }
+        $added = Join-Path $fixture.Main "modules/new [module]"
+        (& git -C $added branch --show-current) | Should -Be "fresh"
+        (& git -C $added rev-parse HEAD) | Should -Be $freshCommit
+        (& git -C (Join-Path $added "nested") branch --show-current) | Should -Be "developbim"
+        Test-Path -LiteralPath (Join-Path $fixture.Main "modules/ignored/.git") | Should -BeFalse
+    }
+
+    It "reports uninitialized submodules without creating a checkout in <Mode> DryRun=<DryRun>" -ForEach @(
+        @{ Mode = "All"; DryRun = $true; Expected = '计划: 初始化子模块' }
+        @{ Mode = "PullOnly"; DryRun = $false; Expected = '子模块尚未初始化' }
+    ) {
+        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "new-$Mode-$DryRun")
+        $source = Invoke-TestMainSourceSetup -Fixture $fixture
+        $commit = & git -C $fixture.ChildSource rev-parse HEAD
+        Add-TestGitlink -Repository $source -Name "new-module" -Path "modules/new" -Url $fixture.ChildRemote -Commit $commit -Branch "release"
+        Invoke-TestGit -Repository $source -ArgumentList @("commit", "-m", "add new module")
+        Invoke-TestGit -Repository $source -ArgumentList @("push", "origin", "developbim")
+        $oldMainHead = & git -C $fixture.Main rev-parse HEAD
+
+        $result = Invoke-ScriptUnderTest -Fixture $fixture -Mode $Mode -DryRun:$DryRun
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match $Expected
+        Test-Path -LiteralPath (Join-Path $fixture.Main "modules/new/.git") | Should -BeFalse
+        if ($DryRun) { (& git -C $fixture.Main rev-parse HEAD) | Should -Be $oldMainHead }
+    }
+
+    It "initializes an uninitialized submodule already registered on the local branch in CheckoutOnly" {
+        $fixture = Invoke-TestFixtureSetup -Root (Join-Path $TestDrive "checkout-only-init")
+        $commit = & git -C $fixture.ChildSource rev-parse HEAD
+        Add-TestGitlink -Repository $fixture.Main -Name "new-module" -Path "modules/new" -Url $fixture.ChildRemote -Commit $commit -Branch "release"
+        Invoke-TestGit -Repository $fixture.Main -ArgumentList @("commit", "-m", "register local submodule")
+        $mainHead = & git -C $fixture.Main rev-parse HEAD
+
+        $priorProtocols = $env:GIT_ALLOW_PROTOCOL
+        try {
+            $env:GIT_ALLOW_PROTOCOL = "file"
+            $result = Invoke-ScriptUnderTest -Fixture $fixture -Mode CheckoutOnly
+        } finally {
+            $env:GIT_ALLOW_PROTOCOL = $priorProtocols
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'new\s+已初始化子模块'
+        $result.Output | Should -Not -Match '\bpull OK\b'
+        (& git -C (Join-Path $fixture.Main "modules/new") branch --show-current) | Should -Be "release"
+        (& git -C $fixture.Main rev-parse HEAD) | Should -Be $mainHead
     }
 
     It "processes independent repositories in container mode" {
